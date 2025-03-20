@@ -1,0 +1,56 @@
+<<<<<<< HEAD
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+=======
+# Arquivos de build e binários
+>>>>>>> 54a3c08 (Versão inicial do Projeto_PLC)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+<<<<<<< HEAD
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+=======
+*.test
+*.out
+
+# Arquivos específicos do Go
+/vendor/
+/go.sum
+
+# Arquivos de configuração com senhas
+config/database.local.go
+config/security.local.go
+
+# Arquivos temporários
+*.tmp
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
+
+# Arquivos e pastas específicos do sistema
+.DS_Store
+.vscode/
+.idea/
+>>>>>>> 54a3c08 (Versão inicial do Projeto_PLC)
