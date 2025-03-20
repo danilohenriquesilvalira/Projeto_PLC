@@ -1,0 +1,95 @@
+{
+  "Database": {
+    "PostgreSQL": {
+      "Host": "localhost",
+      "Port": 5432,
+      "User": "danilo",
+      "Password": "Danilo@34333528",
+      "Database": "permanent_data",
+      "SSLMode": "disable"
+    },
+    "TimescaleDB": {
+      "Host": "localhost",
+      "Port": 5432,
+      "User": "danilo",
+      "Password": "Danilo@34333528",
+      "Database": "timeseries_data",
+      "SSLMode": "disable"
+    },
+    "Redis": {
+      "Host": "localhost",
+      "Port": 6379,
+      "Password": "",
+      "DB": 0
+    }
+  },
+  "PLCManager": {
+    "check_interval_seconds": 5,
+    "reconnect_interval_seconds": 5,
+    "status_interval_seconds": 30,
+    "tag_reload_interval_seconds": 2,
+    "min_scan_rate_ms": 10
+  },
+  "DataCollector": {
+    "history_interval_seconds": 300,
+    "enable_data_retention": true,
+    "retention_days": 30,
+    "batch_size": 1000,
+    "enable_compression": true,
+    "max_workers": 5
+  },
+  "API": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "read_timeout_seconds": 30,
+    "write_timeout_seconds": 30,
+    "shutdown_timeout_seconds": 10,
+    "enable_cors": true
+  },
+  "Security": {
+    "jwt": {
+      "secret": "seu_jwt_secret_aqui_mudar_em_producao",
+      "expiration_hours": 24
+    },
+    "rate_limit": {
+      "enabled": true,
+      "requests_max": 100,
+      "window_seconds": 60
+    },
+    "cors": {
+      "allow_origins": [
+        "*"
+      ],
+      "allow_credentials": true,
+      "allow_methods": [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "OPTIONS"
+      ],
+      "allow_headers": [
+        "Origin",
+        "Content-Type",
+        "Accept",
+        "Authorization"
+      ],
+      "expose_headers": [
+        "Content-Length"
+      ],
+      "max_age": 86400
+    },
+    "password_policy": {
+      "min_length": 8,
+      "require_upper": true,
+      "require_lower": true,
+      "require_number": true,
+      "require_special": true
+    },
+    "tls": {
+      "enabled": false,
+      "cert_file": "cert.pem",
+      "key_file": "key.pem"
+    }
+  }
+}

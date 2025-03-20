@@ -1,0 +1,30 @@
+# Arquivos de build e binários
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Arquivos específicos do Go
+/vendor/
+/go.sum
+
+# Arquivos de configuração com senhas
+config/database.local.go
+config/security.local.go
+
+# Arquivos temporários
+*.tmp
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
+
+# Arquivos e pastas específicos do sistema
+.DS_Store
+.vscode/
+.idea/
