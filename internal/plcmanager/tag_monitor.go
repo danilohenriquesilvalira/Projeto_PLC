@@ -77,7 +77,10 @@ func (m *Manager) managePLCTags(ctx context.Context, plcID int, plcName string, 
 	// Contador para verificar alterações no número de tags
 	var lastTagCount int
 
-	log.Printf("Iniciando gerenciamento de tags para PLC %s (ID: %d)", plcName, plcID)
+	// Registra início do monitoramento apenas uma vez
+	m.logger.InfoWithDetails("Tag Monitor",
+		fmt.Sprintf("Iniciando gerenciamento de tags para PLC %s", plcName),
+		fmt.Sprintf("PLC ID: %d, Endereço IP: %s", plcID, client.GetConfig().IPAddress))
 
 	// Desativar logs detalhados por padrão
 	DetailedLogging = false
@@ -85,17 +88,25 @@ func (m *Manager) managePLCTags(ctx context.Context, plcID int, plcName string, 
 	for {
 		select {
 		case <-ctx.Done():
-			// Encerra todas as goroutines de tags
+			// Encerra todas as goroutines de tags sem logar cada uma individualmente
 			for tagID, runner := range tagRunners {
 				runner.cancel()
-				log.Printf("Encerrado monitoramento da tag ID %d no PLC %s", tagID, plcName)
+				if DetailedLogging {
+					log.Printf("Encerrado monitoramento da tag ID %d no PLC %s", tagID, plcName)
+				}
 			}
-			log.Printf("Encerrando gerenciamento de tags do PLC %s", plcName)
+
+			// Registra o encerramento de todas as tags de uma vez
+			m.logger.InfoWithDetails("Tag Monitor",
+				fmt.Sprintf("Encerrado gerenciamento de tags do PLC %s", plcName),
+				fmt.Sprintf("Foram finalizadas %d tags monitoradas", len(tagRunners)))
+
 			return nil
 
 		case err := <-errChan:
 			// Propaga erros críticos para encerrar o monitoramento do PLC
-			log.Printf("Erro recebido de uma goroutine de tag para PLC %s: %v", plcName, err)
+			errDetails := fmt.Sprintf("PLC: %s (ID: %d), Erro: %v", plcName, plcID, err)
+			m.logger.ErrorWithDetails("Tag Monitor", "Erro crítico no monitoramento de tags", errDetails)
 			return err
 
 		case <-ticker.C:
@@ -104,24 +115,31 @@ func (m *Manager) managePLCTags(ctx context.Context, plcID int, plcName string, 
 			tagsJSON, err := m.cache.GetValue(tagsKey)
 
 			if err != nil {
-				// Erro real ao acessar o cache
-				log.Printf("Erro ao acessar cache para tags do PLC %s: %v", plcName, err)
-				m.logger.Error("Tag Monitor", fmt.Sprintf("Erro ao acessar cache para tags: %v", err))
+				// Erro real ao acessar o cache - usar banco de dados como fallback
+				if DetailedLogging {
+					log.Printf("Erro ao acessar cache para tags do PLC %s: %v", plcName, err)
+				}
+
+				// Usamos o banco de dados apenas em caso de erro no cache
 				tags, dbErr := m.db.GetPLCTags(plcID)
 				if dbErr != nil {
-					log.Printf("Erro ao carregar tags para PLC %s: %v", plcName, dbErr)
-					m.logger.Error("Erro ao carregar tags", fmt.Sprintf("PLC %s: %v", plcName, dbErr))
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Falha ao obter tags para monitoramento",
+						fmt.Sprintf("PLC: %s (ID: %d), Erro: %v", plcName, plcID, dbErr))
 					continue
 				}
 				m.processTags(ctx, plcID, plcName, client, tags, tagRunners, errChan)
 			} else if tagsJSON == "" {
-				// Cache acessível mas sem dados
-				log.Printf("Tags do PLC %s não encontradas no cache (valor vazio), usando banco de dados", plcName)
-				m.logger.Warn("Tag Monitor", fmt.Sprintf("Tags não encontradas no cache para PLC %s", plcName))
+				// Cache acessível mas sem dados - usar banco de dados como fallback
+				if DetailedLogging {
+					log.Printf("Tags do PLC %s não encontradas no cache", plcName)
+				}
+
 				tags, dbErr := m.db.GetPLCTags(plcID)
 				if dbErr != nil {
-					log.Printf("Erro ao carregar tags para PLC %s: %v", plcName, dbErr)
-					m.logger.Error("Erro ao carregar tags", fmt.Sprintf("PLC %s: %v", plcName, dbErr))
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Falha ao obter tags para monitoramento",
+						fmt.Sprintf("PLC: %s (ID: %d), Erro: %v", plcName, plcID, dbErr))
 					continue
 				}
 				m.processTags(ctx, plcID, plcName, client, tags, tagRunners, errChan)
@@ -129,22 +147,29 @@ func (m *Manager) managePLCTags(ctx context.Context, plcID int, plcName string, 
 				// Cache tem dados, prosseguir com a desserialização
 				var tags []database.Tag
 				if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
-					log.Printf("Erro ao deserializar tags do cache para PLC %s: %v", plcName, err)
-					m.logger.Error("Tag Monitor", fmt.Sprintf("Erro ao deserializar tags: %v", err))
+					if DetailedLogging {
+						log.Printf("Erro ao deserializar tags do cache para PLC %s: %v", plcName, err)
+					}
+
+					// Fallback para banco de dados
 					tags, dbErr := m.db.GetPLCTags(plcID)
 					if dbErr != nil {
-						log.Printf("Erro ao carregar tags para PLC %s: %v", plcName, dbErr)
-						m.logger.Error("Erro ao carregar tags", fmt.Sprintf("PLC %s: %v", plcName, dbErr))
+						m.logger.ErrorWithDetails("Tag Monitor",
+							"Falha ao obter tags após erro na deserialização",
+							fmt.Sprintf("PLC: %s (ID: %d), Erro: %v", plcName, plcID, dbErr))
 						continue
 					}
 					m.processTags(ctx, plcID, plcName, client, tags, tagRunners, errChan)
 				} else {
-					// Verifica mudanças na quantidade de tags
+					// Verifica mudanças na quantidade de tags - logar apenas se houver alteração
 					if len(tags) != lastTagCount {
-						log.Printf("Detectada alteração no número de tags para PLC %s: de %d para %d",
-							plcName, lastTagCount, len(tags))
-						m.logger.Info("Alteração no número de tags",
-							fmt.Sprintf("PLC: %s, Tags: %d", plcName, len(tags)))
+						logDetails := fmt.Sprintf("Quantidade anterior: %d, Nova quantidade: %d",
+							lastTagCount, len(tags))
+
+						m.logger.InfoWithDetails("Tag Monitor",
+							fmt.Sprintf("Alteração na quantidade de tags do PLC %s", plcName),
+							logDetails)
+
 						lastTagCount = len(tags)
 					}
 
@@ -168,17 +193,27 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 		}
 	}
 
-	// Opcional: reduz logs desnecessários
+	// Reduzindo logs desnecessários
 	if DetailedLogging {
 		log.Printf("Tags ativas para PLC %s: %d", plcName, len(activeTags))
 	}
+
+	// Variáveis para rastrear alterações
+	tagsAdded := 0
+	tagsRemoved := 0
+	tagsUpdated := 0
 
 	// Inicia ou atualiza monitoramento de tags ativas
 	for tagID, tag := range activeTags {
 		// Verifica se a tag tem configuração válida
 		if tag.DataType == "" {
-			log.Printf("Aviso: Tag %s (ID: %d) tem DataType vazio, ignorando", tag.Name, tag.ID)
-			m.logger.Warn("Tag com DataType inválido", fmt.Sprintf("%s (ID: %d)", tag.Name, tag.ID))
+			if DetailedLogging {
+				log.Printf("Aviso: Tag %s (ID: %d) tem DataType vazio, ignorando", tag.Name, tag.ID)
+			}
+
+			m.logger.WarnWithDetails("Tag Monitor",
+				"Tag com configuração inválida ignorada",
+				fmt.Sprintf("Tag: %s (ID: %d), Problema: DataType vazio", tag.Name, tag.ID))
 			continue
 		}
 
@@ -190,9 +225,16 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 
 		// Verifica se a taxa de scan é razoável (mínimo de 10ms)
 		if newConfig.ScanRate < 10*time.Millisecond {
-			log.Printf("Aviso: Tag %s (ID: %d) tem ScanRate muito baixo (%v), ajustando para 10ms",
-				tag.Name, tag.ID, newConfig.ScanRate)
-			m.logger.Warn("ScanRate ajustado", fmt.Sprintf("%s (ID: %d): %v -> 10ms", tag.Name, tag.ID, newConfig.ScanRate))
+			if DetailedLogging {
+				log.Printf("Aviso: Tag %s (ID: %d) tem ScanRate muito baixo (%v), ajustando para 10ms",
+					tag.Name, tag.ID, newConfig.ScanRate)
+			}
+
+			m.logger.WarnWithDetails("Tag Monitor",
+				"ScanRate ajustado para valor mínimo",
+				fmt.Sprintf("Tag: %s (ID: %d), Valor original: %v, Novo valor: 10ms",
+					tag.Name, tag.ID, newConfig.ScanRate))
+
 			newConfig.ScanRate = 10 * time.Millisecond
 		}
 
@@ -204,8 +246,9 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 			childCtx, cancel := context.WithCancel(ctx)
 			tagRunners[tagID] = TagRunner{cancel: cancel, config: newConfig}
 			go m.runTag(childCtx, plcID, plcName, tag, client, newConfig, errChan)
-			log.Printf("Iniciou monitoramento da tag %s (ID: %d) no PLC %s", tag.Name, tag.ID, plcName)
-			m.logger.Info("Iniciou monitoramento da tag", fmt.Sprintf("%s (ID: %d)", tag.Name, tag.ID))
+
+			// Contabiliza para log agregado
+			tagsAdded++
 
 		} else if runner.config != newConfig {
 			// Configuração alterada, reinicia a goroutine
@@ -213,8 +256,9 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 			childCtx, cancel := context.WithCancel(ctx)
 			tagRunners[tagID] = TagRunner{cancel: cancel, config: newConfig}
 			go m.runTag(childCtx, plcID, plcName, tag, client, newConfig, errChan)
-			log.Printf("Reiniciou monitoramento da tag %s (ID: %d) no PLC %s com novas configurações", tag.Name, tag.ID, plcName)
-			m.logger.Info("Reiniciou monitoramento da tag", fmt.Sprintf("%s (ID: %d) - Configuração alterada", tag.Name, tag.ID))
+
+			// Contabiliza para log agregado
+			tagsUpdated++
 		}
 	}
 
@@ -223,9 +267,20 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 		if _, exists := activeTags[tagID]; !exists {
 			runner.cancel()
 			delete(tagRunners, tagID)
-			log.Printf("Encerrado monitoramento da tag ID %d no PLC %s", tagID, plcName)
-			m.logger.Warn("Encerrado monitoramento da tag", fmt.Sprintf("ID: %d", tagID))
+
+			// Contabiliza para log agregado
+			tagsRemoved++
 		}
+	}
+
+	// Registra um resumo das alterações apenas se houver mudanças
+	if tagsAdded > 0 || tagsRemoved > 0 || tagsUpdated > 0 {
+		details := fmt.Sprintf("Adicionadas: %d, Removidas: %d, Reconfiguradas: %d, Total ativo: %d",
+			tagsAdded, tagsRemoved, tagsUpdated, len(tagRunners))
+
+		m.logger.InfoWithDetails("Tag Monitor",
+			fmt.Sprintf("Atualização nas tags monitoradas do PLC %s", plcName),
+			details)
 	}
 }
 
@@ -233,16 +288,20 @@ func (m *Manager) processTags(ctx context.Context, plcID int, plcName string, cl
 func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag database.Tag, client *plclib.Client, config TagConfig, errChan chan error) {
 	// Verificação de segurança para evitar nil pointer dereference
 	if client == nil {
-		log.Printf("Erro crítico: cliente PLC nulo para a tag %s no PLC %s", tag.Name, plcName)
-		m.logger.Error("Cliente PLC nulo", fmt.Sprintf("Tag: %s, PLC: %s", tag.Name, plcName))
-		errChan <- fmt.Errorf("cliente PLC nulo para a tag %s", tag.Name)
+		errMsg := fmt.Sprintf("Cliente PLC nulo para tag %s (ID: %d) no PLC %s (ID: %d)",
+			tag.Name, tag.ID, plcName, plcID)
+
+		m.logger.ErrorWithDetails("Tag Monitor", "Falha crítica de inicialização", errMsg)
+		errChan <- fmt.Errorf(errMsg)
 		return
 	}
 
 	if m.cache == nil {
-		log.Printf("Erro crítico: cache nulo para a tag %s no PLC %s", tag.Name, plcName)
-		m.logger.Error("Cache nulo", fmt.Sprintf("Tag: %s, PLC: %s", tag.Name, plcName))
-		errChan <- fmt.Errorf("cache nulo para a tag %s", tag.Name)
+		errMsg := fmt.Sprintf("Cache nulo para tag %s (ID: %d) no PLC %s (ID: %d)",
+			tag.Name, tag.ID, plcName, plcID)
+
+		m.logger.ErrorWithDetails("Tag Monitor", "Falha crítica de inicialização", errMsg)
+		errChan <- fmt.Errorf(errMsg)
 		return
 	}
 
@@ -250,15 +309,18 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 	byteOffset := int(tag.ByteOffset)
 	bitOffset := tag.BitOffset
 
-	log.Printf("Iniciando coleta para tag %s (ID: %d) no PLC %s (DB: %d, ByteOffset: %d, BitOffset: %d, Tipo: %s)",
-		tag.Name, tag.ID, plcName, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
+	// Registro do início de monitoramento apenas em modo detalhado
+	if DetailedLogging {
+		log.Printf("Iniciando coleta para tag %s (ID: %d) no PLC %s (DB: %d, ByteOffset: %d, BitOffset: %d, Tipo: %s)",
+			tag.Name, tag.ID, plcName, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
+	}
 
 	// Registra o nome da tag no cache para facilitar busca por nome
 	if err := m.cache.RegisterTagName(plcID, tag.ID, tag.Name); err != nil {
-		log.Printf("Erro ao registrar nome da tag %s no cache: %v", tag.Name, err)
+		if DetailedLogging {
+			log.Printf("Erro ao registrar nome da tag %s no cache: %v", tag.Name, err)
+		}
 		// Não é um erro crítico, continua mesmo assim
-	} else {
-		log.Printf("Nome da tag %s registrado no cache com sucesso", tag.Name)
 	}
 
 	ticker := time.NewTicker(config.ScanRate)
@@ -266,6 +328,7 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 
 	// Para rastrear mudanças
 	var lastValue interface{}
+	var lastErrorMessage string
 	consecutiveErrors := 0
 	maxConsecutiveErrors := 5 // Após 5 erros consecutivos, reporta erro crítico
 
@@ -283,32 +346,36 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Encerrando monitoramento da tag %s (%s)", tag.Name, plcName)
-			m.logger.Warn("Encerramento do monitoramento da tag", tag.Name)
+			if DetailedLogging {
+				log.Printf("Encerrando monitoramento da tag %s (%s)", tag.Name, plcName)
+			}
 			return
 
 		case <-ticker.C:
 			// Verificar novamente se o cliente ainda é válido antes de cada operação
 			if client == nil {
-				log.Printf("Cliente PLC tornou-se nulo durante execução para a tag %s no PLC %s", tag.Name, plcName)
-				m.logger.Error("Cliente PLC nulo durante execução", fmt.Sprintf("Tag: %s, PLC: %s", tag.Name, plcName))
-				errChan <- fmt.Errorf("cliente PLC tornou-se nulo durante execução para a tag %s", tag.Name)
+				errMsg := fmt.Sprintf("Cliente PLC tornou-se nulo durante execução para tag %s (ID: %d) no PLC %s (ID: %d)",
+					tag.Name, tag.ID, plcName, plcID)
+
+				m.logger.ErrorWithDetails("Tag Monitor", "Falha crítica durante execução", errMsg)
+				errChan <- fmt.Errorf(errMsg)
 				return
 			}
 
 			// Verificar conexão com ping para tags críticas ou após erros
 			if consecutiveErrors > 0 {
 				if err := client.Ping(); err != nil {
-					log.Printf("Erro ao verificar conexão com PLC para tag %s: %v", tag.Name, err)
-
-					// Incrementar contador de erros
+					// Nova falha de ping, incrementar contador sem logar cada erro
 					consecutiveErrors++
 
 					// Aplicar recuo exponencial
 					if currentDelay < maxDelay {
 						currentDelay = minDuration(currentDelay*2, maxDelay)
 						resetTicker(currentDelay)
-						log.Printf("Ajustando delay para %v após erro na tag %s", currentDelay, tag.Name)
+
+						if DetailedLogging {
+							log.Printf("Ajustando delay para %v após erro na tag %s", currentDelay, tag.Name)
+						}
 					}
 
 					// Define qualidade baixa para o valor no cache para indicar problema
@@ -316,12 +383,17 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 						_ = m.cache.SetTagValueWithQuality(plcID, tag.ID, prevValue.Value, 0)
 					}
 
-					// Verificar se atingimos o limite de erros consecutivos
-					if consecutiveErrors >= maxConsecutiveErrors {
-						log.Printf("Erro crítico após %d falhas consecutivas na tag %s",
-							consecutiveErrors, tag.Name)
-						errChan <- fmt.Errorf("erros consecutivos na tag %s: último erro: %v",
-							tag.Name, err)
+					// Verificar se atingimos o limite de erros consecutivos - logar apenas na mudança de estado
+					if consecutiveErrors == maxConsecutiveErrors {
+						errMsg := fmt.Sprintf("Tag: %s (ID: %d), PLC: %s (ID: %d), Quantidade de erros: %d",
+							tag.Name, tag.ID, plcName, plcID, consecutiveErrors)
+
+						m.logger.ErrorWithDetails("Tag Monitor",
+							"Limite de erros consecutivos atingido",
+							errMsg)
+
+						errChan <- fmt.Errorf("erros consecutivos na tag %s (ID: %d): %s",
+							tag.Name, tag.ID, lastErrorMessage)
 						return
 					}
 
@@ -329,26 +401,47 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				}
 
 				// Se o ping teve sucesso, resetar contador de erros e delay
-				log.Printf("Conexão restaurada para tag %s após %d erros", tag.Name, consecutiveErrors)
+				if DetailedLogging {
+					log.Printf("Conexão restaurada para tag %s após %d erros", tag.Name, consecutiveErrors)
+				}
+
+				if consecutiveErrors >= 3 {
+					// Registrar apenas se houve várias falhas seguidas
+					m.logger.InfoWithDetails("Tag Monitor",
+						"Conexão restaurada após falhas consecutivas",
+						fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Quantidade de erros corrigidos: %d",
+							tag.Name, tag.ID, plcName, consecutiveErrors))
+				}
+
 				consecutiveErrors = 0
+
 				if currentDelay != baseDelay {
 					currentDelay = baseDelay
 					resetTicker(currentDelay)
-					log.Printf("Reset delay para %v após recuperação da tag %s", currentDelay, tag.Name)
 				}
-			}
-
-			// Log de tentativa de leitura (só mostra se DetailedLogging ativado)
-			if DetailedLogging {
-				log.Printf("Tentando ler tag %s (ID: %d) do PLC %s - DB: %d, ByteOffset: %d, BitOffset: %d, DataType: %s",
-					tag.Name, tag.ID, plcName, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
 			}
 
 			// Tentar ler o valor, com tratamento especial para erros de rede
 			rawValue, err := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, bitOffset)
 			if err != nil {
-				log.Printf("Erro ao ler tag %s no PLC %s: %v", tag.Name, plcName, err)
-				m.logger.Error("Erro ao ler tag", fmt.Sprintf("%s: %v", tag.Name, err))
+				// Armazena a mensagem de erro para referência
+				lastErrorMessage = err.Error()
+
+				if isNetworkError(err) {
+					if consecutiveErrors == 0 {
+						// Registra apenas o primeiro erro de uma sequência
+						m.logger.ErrorWithDetails("Tag Monitor",
+							"Erro de rede na leitura de tag",
+							fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Erro: %v",
+								tag.Name, tag.ID, plcName, err))
+					}
+				} else {
+					// Erros não relacionados a rede podem ser mais relevantes
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Erro na leitura de tag",
+						fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Erro: %v",
+							tag.Name, tag.ID, plcName, err))
+				}
 
 				// Incrementar contador de erros consecutivos
 				consecutiveErrors++
@@ -357,24 +450,24 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				if currentDelay < maxDelay {
 					currentDelay = minDuration(currentDelay*2, maxDelay)
 					resetTicker(currentDelay)
-					log.Printf("Ajustando delay para %v após erro na tag %s", currentDelay, tag.Name)
 				}
 
 				// Define qualidade baixa para o valor no cache para indicar problema
 				if prevValue, _ := m.cache.GetTagValue(plcID, tag.ID); prevValue != nil {
 					_ = m.cache.SetTagValueWithQuality(plcID, tag.ID, prevValue.Value, 0)
-					log.Printf("Qualidade da tag %s definida como 0 devido a erro de leitura", tag.Name)
 				}
 
-				// Verificar se é um erro crítico de rede
-				if isNetworkError(err) {
-					// Se for um erro de rede e excedemos o limite, reportar como erro crítico
-					if consecutiveErrors >= maxConsecutiveErrors {
-						log.Printf("Erro crítico de rede após %d falhas consecutivas na tag %s",
-							consecutiveErrors, tag.Name)
-						errChan <- fmt.Errorf("erro crítico de rede na tag %s: %v", tag.Name, err)
-						return
-					}
+				// Verificar se é um erro crítico de rede que excedeu o limite
+				if isNetworkError(err) && consecutiveErrors >= maxConsecutiveErrors {
+					errMsg := fmt.Sprintf("Tag: %s (ID: %d), PLC: %s (ID: %d), Erro: %v",
+						tag.Name, tag.ID, plcName, plcID, err)
+
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Falha crítica após múltiplos erros de rede",
+						errMsg)
+
+					errChan <- fmt.Errorf("erro crítico de rede na tag %s: %v", tag.Name, err)
+					return
 				}
 
 				continue
@@ -382,32 +475,38 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 
 			// Leitura bem-sucedida, resetar contador de erros e delay
 			if consecutiveErrors > 0 {
-				log.Printf("Leitura restaurada para tag %s após %d erros", tag.Name, consecutiveErrors)
+				if consecutiveErrors >= 3 {
+					// Registrar apenas se houve várias falhas seguidas
+					m.logger.InfoWithDetails("Tag Monitor",
+						"Leitura normalizada após falhas consecutivas",
+						fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Falhas corrigidas: %d",
+							tag.Name, tag.ID, plcName, consecutiveErrors))
+				}
+
 				consecutiveErrors = 0
+
 				if currentDelay != baseDelay {
 					currentDelay = baseDelay
 					resetTicker(currentDelay)
 				}
 			}
 
-			// Log do valor somente se DetailedLogging ativado ou se valor mudou
-			valueChanged := !plclib.CompareValues(lastValue, rawValue)
-			if DetailedLogging || valueChanged {
-				log.Printf("Valor lido para tag %s (ID: %d): tipo=%T, valor=%v",
-					tag.Name, tag.ID, rawValue, rawValue)
-				lastValue = rawValue
-			}
-
 			// Verificação para evitar armazenar tagID como valor
 			if intValue, ok := rawValue.(int); ok && intValue == tag.ID {
-				log.Printf("ALERTA: Tag %s (ID: %d) retornou valor igual ao seu ID. Possível erro de leitura!",
-					tag.Name, tag.ID)
-				m.logger.Error("Valor suspeito para tag",
-					fmt.Sprintf("Tag %s (ID: %d) retornou valor igual ao ID", tag.Name, tag.ID))
+				errMsg := fmt.Sprintf("Tag %s (ID: %d) retornou valor igual ao seu ID (%d). Possível erro de leitura!",
+					tag.Name, tag.ID, tag.ID)
+
+				m.logger.ErrorWithDetails("Tag Monitor",
+					"Valor suspeito detectado",
+					errMsg)
+
 				continue
 			}
 
-			// Se configurado para monitorar apenas mudanças
+			// Verifica se o valor mudou
+			valueChanged := !plclib.CompareValues(lastValue, rawValue)
+
+			// Se configurado para monitorar apenas mudanças e o valor não mudou, não armazena
 			if config.MonitorChanges {
 				oldValue, err := m.cache.GetTagValue(plcID, tag.ID)
 				// Verificar explicitamente se oldValue não é nil antes de comparar
@@ -422,16 +521,32 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				// Garante que valores booleanos sejam tratados corretamente
 				if boolVal, ok := rawValue.(bool); ok {
 					if err := m.cache.SetTagValue(plcID, tag.ID, boolVal); err != nil {
-						log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
-						m.logger.Error("Erro ao atualizar cache para tag", fmt.Sprintf("%s: %v", tag.Name, err))
-					} else if DetailedLogging || valueChanged {
-						log.Printf("%s - Tag %s (bool) atualizada: %v", plcName, tag.Name, boolVal)
+						if DetailedLogging {
+							log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
+						}
+					} else if valueChanged {
+						// Log apenas quando o valor muda
+						if DetailedLogging {
+							log.Printf("%s - Tag %s (bool) atualizada: %v", plcName, tag.Name, boolVal)
+						}
+
+						// Publica apenas quando há mudança
 						_ = m.cache.PublishTagUpdate(plcID, tag.ID, boolVal)
+
+						// Registra mudanças significativas mas não todas
+						if tag.Name != "" && strings.Contains(strings.ToLower(tag.Name), "status") {
+							m.logger.InfoWithDetails("Tag Monitor",
+								fmt.Sprintf("Alteração em tag de status: %s", tag.Name),
+								fmt.Sprintf("PLC: %s, Novo valor: %v", plcName, boolVal))
+						}
 					}
 				} else {
-					log.Printf("ERRO: Valor para tag bool %s não é do tipo bool, é %T", tag.Name, rawValue)
-					m.logger.Error("Tipo incorreto para tag bool",
-						fmt.Sprintf("Tag: %s, Tipo esperado: bool, Tipo recebido: %T", tag.Name, rawValue))
+					errMsg := fmt.Sprintf("Tag: %s (ID: %d), Tipo esperado: bool, Tipo recebido: %T",
+						tag.Name, tag.ID, rawValue)
+
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Tipo incorreto recebido para tag booleana",
+						errMsg)
 				}
 
 			case "int", "word", "dint":
@@ -457,17 +572,27 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				case uint64:
 					intValue = int64(v)
 				default:
-					log.Printf("ERRO: Valor para tag int/word/dint %s não é um tipo inteiro, é %T", tag.Name, rawValue)
-					m.logger.Error("Tipo incorreto para tag inteira",
-						fmt.Sprintf("Tag: %s, Tipo esperado: int/word/dint, Tipo recebido: %T", tag.Name, rawValue))
+					errMsg := fmt.Sprintf("Tag: %s (ID: %d), Tipo esperado: inteiro, Tipo recebido: %T",
+						tag.Name, tag.ID, rawValue)
+
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Tipo incorreto recebido para tag inteira",
+						errMsg)
+
 					continue
 				}
 
 				if err := m.cache.SetTagValue(plcID, tag.ID, intValue); err != nil {
-					log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
-					m.logger.Error("Erro ao atualizar cache para tag", fmt.Sprintf("%s: %v", tag.Name, err))
-				} else if DetailedLogging || valueChanged {
-					log.Printf("%s - Tag %s (%s) atualizada: %v", plcName, tag.Name, tag.DataType, intValue)
+					if DetailedLogging {
+						log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
+					}
+				} else if valueChanged {
+					// Log apenas quando o valor muda
+					if DetailedLogging {
+						log.Printf("%s - Tag %s (%s) atualizada: %v", plcName, tag.Name, tag.DataType, intValue)
+					}
+
+					// Publica apenas quando há mudança
 					_ = m.cache.PublishTagUpdate(plcID, tag.ID, intValue)
 				}
 
@@ -486,17 +611,27 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				case int64:
 					floatValue = float64(v)
 				default:
-					log.Printf("ERRO: Valor para tag real %s não é um tipo float, é %T", tag.Name, rawValue)
-					m.logger.Error("Tipo incorreto para tag real",
-						fmt.Sprintf("Tag: %s, Tipo esperado: real, Tipo recebido: %T", tag.Name, rawValue))
+					errMsg := fmt.Sprintf("Tag: %s (ID: %d), Tipo esperado: real, Tipo recebido: %T",
+						tag.Name, tag.ID, rawValue)
+
+					m.logger.ErrorWithDetails("Tag Monitor",
+						"Tipo incorreto recebido para tag real",
+						errMsg)
+
 					continue
 				}
 
 				if err := m.cache.SetTagValue(plcID, tag.ID, floatValue); err != nil {
-					log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
-					m.logger.Error("Erro ao atualizar cache para tag", fmt.Sprintf("%s: %v", tag.Name, err))
-				} else if DetailedLogging || valueChanged {
-					log.Printf("%s - Tag %s (real) atualizada: %v", plcName, tag.Name, floatValue)
+					if DetailedLogging {
+						log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
+					}
+				} else if valueChanged {
+					// Log apenas quando o valor muda
+					if DetailedLogging {
+						log.Printf("%s - Tag %s (real) atualizada: %v", plcName, tag.Name, floatValue)
+					}
+
+					// Publica apenas quando há mudança
 					_ = m.cache.PublishTagUpdate(plcID, tag.ID, floatValue)
 				}
 
@@ -511,26 +646,49 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				default:
 					// Tenta converter para string, mesmo que não seja do tipo ideal
 					strValue = fmt.Sprintf("%v", v)
-					log.Printf("AVISO: Valor para tag string %s não é string, é %T. Convertendo...", tag.Name, rawValue)
+
+					warnMsg := fmt.Sprintf("Tag: %s (ID: %d), Tipo esperado: string, Tipo recebido: %T",
+						tag.Name, tag.ID, rawValue)
+
+					m.logger.WarnWithDetails("Tag Monitor",
+						"Tipo inesperado convertido para string",
+						warnMsg)
 				}
 
 				if err := m.cache.SetTagValue(plcID, tag.ID, strValue); err != nil {
-					log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
-					m.logger.Error("Erro ao atualizar cache para tag", fmt.Sprintf("%s: %v", tag.Name, err))
-				} else if DetailedLogging || valueChanged {
-					log.Printf("%s - Tag %s (string) atualizada: %v", plcName, tag.Name, strValue)
+					if DetailedLogging {
+						log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
+					}
+				} else if valueChanged {
+					// Log apenas quando o valor muda
+					if DetailedLogging {
+						log.Printf("%s - Tag %s (string) atualizada: %v", plcName, tag.Name, strValue)
+					}
+
+					// Publica apenas quando há mudança
 					_ = m.cache.PublishTagUpdate(plcID, tag.ID, strValue)
 				}
 
 			default:
 				// Caso para outros tipos de dados ou não reconhecidos
 				if err := m.cache.SetTagValue(plcID, tag.ID, rawValue); err != nil {
-					log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
-					m.logger.Error("Erro ao atualizar cache para tag", fmt.Sprintf("%s: %v", tag.Name, err))
-				} else if DetailedLogging || valueChanged {
-					log.Printf("%s - Tag %s (%s) atualizada: %v", plcName, tag.Name, tag.DataType, rawValue)
+					if DetailedLogging {
+						log.Printf("Erro ao atualizar cache para tag %s no PLC %s: %v", tag.Name, plcName, err)
+					}
+				} else if valueChanged {
+					// Log apenas quando o valor muda
+					if DetailedLogging {
+						log.Printf("%s - Tag %s (%s) atualizada: %v", plcName, tag.Name, tag.DataType, rawValue)
+					}
+
+					// Publica apenas quando há mudança
 					_ = m.cache.PublishTagUpdate(plcID, tag.ID, rawValue)
 				}
+			}
+
+			// Se o valor mudou, atualiza a última referência
+			if valueChanged {
+				lastValue = rawValue
 			}
 		}
 	}
@@ -572,27 +730,22 @@ func (m *Manager) GetTagValue(plcID int, tagName string) (interface{}, error) {
 	byteOffset := int(tag.ByteOffset)
 	bitOffset := tag.BitOffset
 
-	// CORREÇÃO: Log só se DetailedLogging estiver ativado
-	if DetailedLogging {
-		log.Printf("Lendo tag %s diretamente do PLC %s - DB: %d, ByteOffset: %d, BitOffset: %d, DataType: %s",
-			tag.Name, plcConfig.Name, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
-	}
-
 	// Ler o valor do PLC
 	rawValue, err := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, bitOffset)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao ler a tag %s do PLC: %w", tagName, err)
-	}
+		m.logger.ErrorWithDetails("Tag Monitor",
+			fmt.Sprintf("Erro ao ler tag %s diretamente do PLC", tagName),
+			fmt.Sprintf("PLC: %s (ID: %d), Tag ID: %d, Erro: %v",
+				plcConfig.Name, plcID, tag.ID, err))
 
-	// CORREÇÃO: Log só se DetailedLogging estiver ativado
-	if DetailedLogging {
-		log.Printf("Valor lido diretamente do PLC para tag %s: %v (tipo: %T)",
-			tag.Name, rawValue, rawValue)
+		return nil, fmt.Errorf("erro ao ler a tag %s do PLC: %w", tagName, err)
 	}
 
 	// Atualiza o cache
 	if err := m.cache.SetTagValue(plcID, tag.ID, rawValue); err != nil {
-		log.Printf("Aviso: Não foi possível atualizar o cache: %v", err)
+		if DetailedLogging {
+			log.Printf("Aviso: Não foi possível atualizar o cache: %v", err)
+		}
 		// Não falha se apenas o cache falhar
 	}
 
@@ -607,6 +760,10 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 	// Busca todos os valores do cache
 	tagValues, err := m.cache.GetAllPLCTags(plcID)
 	if err != nil {
+		m.logger.ErrorWithDetails("Tag Monitor",
+			"Erro ao obter valores de todas as tags",
+			fmt.Sprintf("PLC ID: %d, Erro: %v", plcID, err))
+
 		return nil, fmt.Errorf("erro ao buscar valores das tags: %w", err)
 	}
 
@@ -618,6 +775,10 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 		// Fallback para o banco de dados
 		tags, err = m.db.GetPLCTags(plcID)
 		if err != nil {
+			m.logger.ErrorWithDetails("Tag Monitor",
+				"Erro ao obter metadados das tags",
+				fmt.Sprintf("PLC ID: %d, Erro: %v", plcID, err))
+
 			return nil, fmt.Errorf("erro ao buscar tags do PLC: %w", err)
 		}
 	} else {
@@ -626,6 +787,11 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 			// Fallback para o banco de dados
 			tags, err = m.db.GetPLCTags(plcID)
 			if err != nil {
+				m.logger.ErrorWithDetails("Tag Monitor",
+					"Erro ao deserializar e obter metadados das tags",
+					fmt.Sprintf("PLC ID: %d, Erro de deserialização: %v, Erro de banco: %v",
+						plcID, err, err))
+
 				return nil, fmt.Errorf("erro ao buscar tags do PLC: %w", err)
 			}
 		}
@@ -639,14 +805,20 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 
 	// Constrói o mapa com nomes das tags e valores
 	result := make(map[string]interface{})
+	var valuesFixed int
+
 	for tagID, tagValue := range tagValues {
 		if name, ok := idToName[tagID]; ok {
 			// Verifica se não está retornando o ID como valor
 			if intValue, ok := tagValue.Value.(int); ok && intValue == tagID {
-				log.Printf("ALERTA: Tag %s (ID: %d) tem valor armazenado igual ao seu ID!",
-					name, tagID)
-				m.logger.Error("Valor suspeito no cache",
-					fmt.Sprintf("Tag %s (ID: %d) tem valor igual ao ID", name, tagID))
+				if DetailedLogging {
+					log.Printf("ALERTA: Tag %s (ID: %d) tem valor armazenado igual ao seu ID!",
+						name, tagID)
+				}
+
+				m.logger.WarnWithDetails("Tag Monitor",
+					"Valor suspeito detectado",
+					fmt.Sprintf("Tag: %s (ID: %d) tem valor igual ao seu ID", name, tagID))
 
 				// Tenta reler a tag diretamente do PLC para corrigir o valor
 				tag, tagErr := m.db.GetTagByID(tagID)
@@ -660,21 +832,29 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 						correctedValue, readErr := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, tag.BitOffset)
 
 						if readErr == nil {
-							log.Printf("Corrigindo valor da tag %s: leitura direta resultou em %v",
-								name, correctedValue)
+							if DetailedLogging {
+								log.Printf("Corrigindo valor da tag %s: leitura direta resultou em %v",
+									name, correctedValue)
+							}
+
+							m.logger.InfoWithDetails("Tag Monitor",
+								"Valor suspeito corrigido com leitura direta",
+								fmt.Sprintf("Tag: %s (ID: %d), Novo valor: %v", name, tagID, correctedValue))
 
 							// Atualiza no Redis
 							_ = m.cache.SetTagValue(plcID, tagID, correctedValue)
 
 							// Use o valor corrigido
 							result[name] = correctedValue
+							valuesFixed++
 							continue
 						}
 					}
 				}
 
-				// Se não conseguiu corrigir, continua com aviso
-				log.Printf("Não foi possível corrigir o valor da tag %s, usando valor suspeito", name)
+				if DetailedLogging {
+					log.Printf("Não foi possível corrigir o valor da tag %s, usando valor suspeito", name)
+				}
 			}
 
 			// Caso normal - valor parece correto
@@ -683,6 +863,14 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 			// Aproveita para registrar o nome da tag no cache se ainda não estiver
 			_ = m.cache.RegisterTagName(plcID, tagID, name)
 		}
+	}
+
+	// Log apenas se foram corrigidos valores
+	if valuesFixed > 0 {
+		m.logger.InfoWithDetails("Tag Monitor",
+			"Valores suspeitos corrigidos durante leitura",
+			fmt.Sprintf("PLC ID: %d, Valores corrigidos: %d de %d",
+				plcID, valuesFixed, len(tagValues)))
 	}
 
 	return result, nil
@@ -698,6 +886,10 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 		// Fallback para o banco de dados
 		plcConfig, err = m.db.GetPLCByID(plcID)
 		if err != nil {
+			m.logger.ErrorWithDetails("Tag Monitor",
+				"Erro ao obter configuração do PLC para teste",
+				fmt.Sprintf("PLC ID: %d, Erro: %v", plcID, err))
+
 			return nil, fmt.Errorf("erro ao buscar PLC ID %d: %w", plcID, err)
 		}
 	} else {
@@ -707,6 +899,10 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 			// Fallback para o banco de dados
 			plcConfig, err = m.db.GetPLCByID(plcID)
 			if err != nil {
+				m.logger.ErrorWithDetails("Tag Monitor",
+					"Erro ao deserializar e obter configuração do PLC",
+					fmt.Sprintf("PLC ID: %d, Erro: %v", plcID, err))
+
 				return nil, fmt.Errorf("erro ao buscar PLC ID %d: %w", plcID, err)
 			}
 		} else {
@@ -717,8 +913,16 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 	// Verificar se o PLC está online
 	status, err := m.cache.GetValue(fmt.Sprintf("config:plc:%d:status", plcID))
 	if (err != nil || status == "") && plcConfig.Status != "online" {
+		m.logger.WarnWithDetails("Tag Monitor",
+			"Tentativa de teste de leitura em PLC offline",
+			fmt.Sprintf("PLC: %s (ID: %d), Status: offline", plcConfig.Name, plcID))
+
 		return nil, fmt.Errorf("PLC %s (ID=%d) está offline", plcConfig.Name, plcConfig.ID)
 	} else if status != "online" && status != "" {
+		m.logger.WarnWithDetails("Tag Monitor",
+			"Tentativa de teste de leitura em PLC não disponível",
+			fmt.Sprintf("PLC: %s (ID: %d), Status: %s", plcConfig.Name, plcID, status))
+
 		return nil, fmt.Errorf("PLC %s (ID=%d) está %s", plcConfig.Name, plcConfig.ID, status)
 	}
 
@@ -730,6 +934,10 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 		// Fallback para o banco de dados
 		tag, err = m.db.GetTagByID(tagID)
 		if err != nil {
+			m.logger.ErrorWithDetails("Tag Monitor",
+				"Erro ao obter configuração da tag para teste",
+				fmt.Sprintf("Tag ID: %d, Erro: %v", tagID, err))
+
 			return nil, fmt.Errorf("erro ao buscar tag ID %d: %w", tagID, err)
 		}
 	} else {
@@ -739,6 +947,10 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 			// Fallback para o banco de dados
 			tag, err = m.db.GetTagByID(tagID)
 			if err != nil {
+				m.logger.ErrorWithDetails("Tag Monitor",
+					"Erro ao deserializar e obter configuração da tag",
+					fmt.Sprintf("Tag ID: %d, Erro: %v", tagID, err))
+
 				return nil, fmt.Errorf("erro ao buscar tag ID %d: %w", tagID, err)
 			}
 		} else {
@@ -748,33 +960,51 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 
 	// Verificar se a tag pertence ao PLC correto
 	if tag.PLCID != plcID {
+		m.logger.WarnWithDetails("Tag Monitor",
+			"Tag não pertence ao PLC especificado",
+			fmt.Sprintf("Tag ID: %d, PLC solicitado: %d, PLC real: %d",
+				tagID, plcID, tag.PLCID))
+
 		return nil, fmt.Errorf("tag ID %d não pertence ao PLC ID %d", tagID, plcID)
 	}
 
 	// Usar getOrCreatePLCClient para obter uma conexão
 	client, err := getOrCreatePLCClient(m, plcID)
 	if err != nil {
+		m.logger.ErrorWithDetails("Tag Monitor",
+			"Erro ao criar conexão para teste de leitura",
+			fmt.Sprintf("PLC: %s (ID: %d), Erro: %v", plcConfig.Name, plcID, err))
+
 		return nil, fmt.Errorf("erro ao conectar ao PLC %s: %w", plcConfig.Name, err)
 	}
 	defer client.Close()
 
-	// CORREÇÃO: Converter ByteOffset para inteiro
+	// Converter ByteOffset para inteiro
 	byteOffset := int(tag.ByteOffset)
 	bitOffset := tag.BitOffset
 
 	// Log detalhado antes da leitura
-	log.Printf("[TESTE] Tentando ler tag %s (ID: %d) do PLC %s - DB: %d, ByteOffset: %d, BitOffset: %d, DataType: %s",
-		tag.Name, tag.ID, plcConfig.Name, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
+	m.logger.InfoWithDetails("Tag Monitor",
+		"Iniciando teste de leitura direta",
+		fmt.Sprintf("Tag: %s (ID: %d), PLC: %s (ID: %d), DB: %d, ByteOffset: %d, BitOffset: %d, DataType: %s",
+			tag.Name, tag.ID, plcConfig.Name, plcID, tag.DBNumber, byteOffset, bitOffset, tag.DataType))
 
-	// CORREÇÃO: Passar BitOffset para a função ReadTag
+	// Passar BitOffset para a função ReadTag
 	rawValue, err := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, bitOffset)
 	if err != nil {
+		m.logger.ErrorWithDetails("Tag Monitor",
+			"Erro no teste de leitura direta",
+			fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Erro: %v",
+				tag.Name, tag.ID, plcConfig.Name, err))
+
 		return nil, fmt.Errorf("erro ao ler a tag %s do PLC: %w", tag.Name, err)
 	}
 
 	// Log detalhado após a leitura
-	log.Printf("[TESTE] Valor lido com sucesso para tag %s: %v (tipo: %T)",
-		tag.Name, rawValue, rawValue)
+	m.logger.InfoWithDetails("Tag Monitor",
+		"Teste de leitura direta bem-sucedido",
+		fmt.Sprintf("Tag: %s (ID: %d), PLC: %s, Valor: %v (Tipo: %T)",
+			tag.Name, tag.ID, plcConfig.Name, rawValue, rawValue))
 
 	return rawValue, nil
 }

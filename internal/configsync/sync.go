@@ -15,6 +15,9 @@ import (
 	"Projeto_PLC/internal/database"
 )
 
+// DetailedLogging controla se logs detalhados devem ser exibidos
+var DetailedLogging = false
+
 const (
 	// Chaves para controle de sincronização
 	KeyConfigPLCsHash    = "config:sync:plcs:hash"
@@ -26,42 +29,69 @@ const (
 
 // ConfigSync mantém o Redis atualizado com dados do PostgreSQL
 type ConfigSync struct {
-	db        *database.DB
-	cache     cache.Cache
-	interval  time.Duration
-	ctx       context.Context
-	cancel    context.CancelFunc
-	logger    *database.Logger
-	syncMutex sync.Mutex // Protege contra execuções simultâneas
+	db                 *database.DB
+	cache              cache.Cache
+	interval           time.Duration
+	ctx                context.Context
+	cancel             context.CancelFunc
+	logger             *database.Logger
+	syncMutex          sync.Mutex // Protege contra execuções simultâneas
+	lastSyncAttempt    time.Time  // Último momento em que tentamos sincronizar
+	lastSuccessfulSync time.Time  // Último momento em que a sincronização foi bem-sucedida
+	syncStats          SyncStats  // Estatísticas de sincronização
+	consecutiveErrors  int        // Contador de erros consecutivos para recuo exponencial
+}
+
+// SyncStats mantém estatísticas sobre sincronizações
+type SyncStats struct {
+	TotalSyncs       int           // Número total de sincronizações
+	SuccessfulSyncs  int           // Número de sincronizações bem-sucedidas
+	FailedSyncs      int           // Número de sincronizações com falha
+	TotalPLCsUpdated int           // Número total de PLCs atualizados
+	TotalTagsUpdated int           // Número total de tags atualizadas
+	AverageDuration  time.Duration // Duração média de sincronização
+	LastDuration     time.Duration // Duração da última sincronização
+	LastError        string        // Último erro de sincronização
 }
 
 // NewConfigSync cria um novo sincronizador de configuração
 func NewConfigSync(ctx context.Context, db *database.DB, cache cache.Cache, interval time.Duration, logger *database.Logger) *ConfigSync {
 	syncCtx, cancel := context.WithCancel(ctx)
 	return &ConfigSync{
-		db:        db,
-		cache:     cache,
-		interval:  interval,
-		ctx:       syncCtx,
-		cancel:    cancel,
-		logger:    logger,
-		syncMutex: sync.Mutex{},
+		db:                 db,
+		cache:              cache,
+		interval:           interval,
+		ctx:                syncCtx,
+		cancel:             cancel,
+		logger:             logger,
+		syncMutex:          sync.Mutex{},
+		lastSyncAttempt:    time.Time{},
+		lastSuccessfulSync: time.Time{},
+		syncStats:          SyncStats{},
+		consecutiveErrors:  0,
 	}
 }
 
 // Start inicia a sincronização periódica
 func (s *ConfigSync) Start() error {
-	log.Println("Iniciando sincronizador de configuração")
-	s.logger.Info("ConfigSync", "Iniciando sincronizador de configuração")
+	// Registra início apenas uma vez
+	s.logger.InfoWithDetails("ConfigSync",
+		"Iniciando sistema de sincronização de configurações",
+		fmt.Sprintf("Intervalo configurado: %v", s.interval))
 
 	// Verificar a saúde do cache imediatamente
 	if err := s.healthCheck(); err != nil {
+		s.logger.ErrorWithDetails("ConfigSync",
+			"Falha na verificação inicial do cache",
+			fmt.Sprintf("Erro: %v", err))
 		return err
 	}
 
 	// Força a sincronização inicial completa
 	if err := s.SyncAll(true); err != nil {
-		s.logger.Error("ConfigSync", fmt.Sprintf("Erro na sincronização inicial: %v", err))
+		s.logger.ErrorWithDetails("ConfigSync",
+			"Erro na sincronização inicial",
+			fmt.Sprintf("Erro: %v", err))
 		return fmt.Errorf("erro na sincronização inicial: %w", err)
 	}
 
@@ -78,33 +108,38 @@ func (s *ConfigSync) healthCheck() error {
 
 	// Teste de escrita
 	if err := s.cache.SetValue(testKey, testValue); err != nil {
-		log.Printf("ERRO: Cache não está disponível para escrita: %v", err)
-		s.logger.Error("ConfigSync", fmt.Sprintf("Cache não está disponível para escrita: %v", err))
+		s.logger.ErrorWithDetails("ConfigSync",
+			"Cache não está disponível para escrita",
+			fmt.Sprintf("Erro: %v", err))
 		return fmt.Errorf("cache não está disponível para escrita: %w", err)
 	}
 
 	// Teste de leitura
 	readValue, err := s.cache.GetValue(testKey)
 	if err != nil {
-		log.Printf("ERRO: Cache não está disponível para leitura: %v", err)
-		s.logger.Error("ConfigSync", fmt.Sprintf("Cache não está disponível para leitura: %v", err))
+		s.logger.ErrorWithDetails("ConfigSync",
+			"Cache não está disponível para leitura",
+			fmt.Sprintf("Erro: %v", err))
 		return fmt.Errorf("cache não está disponível para leitura: %w", err)
 	}
 
 	if readValue != testValue {
-		log.Printf("ERRO: Valor lido do cache não corresponde ao valor escrito. Esperado '%s', recebido '%s'",
-			testValue, readValue)
-		s.logger.Error("ConfigSync", "Inconsistência no cache: valores escritos e lidos não correspondem")
+		errMsg := fmt.Sprintf("Esperado: '%s', Recebido: '%s'", testValue, readValue)
+		s.logger.ErrorWithDetails("ConfigSync",
+			"Inconsistência no cache: valores escritos e lidos não correspondem",
+			errMsg)
 		return fmt.Errorf("inconsistência no cache: valores escritos e lidos não correspondem")
 	}
 
-	log.Println("Verificação de saúde do cache: OK")
+	// Só logar em detalhes a cada 1 hora para reduzir volume de logs
+	if time.Since(s.lastSuccessfulSync) > time.Hour {
+		s.logger.Debug("ConfigSync", "Verificação de saúde do cache: OK")
+	}
 	return nil
 }
 
 // Stop para a sincronização
 func (s *ConfigSync) Stop() {
-	log.Println("Parando sincronizador de configuração")
 	s.logger.Info("ConfigSync", "Parando sincronizador de configuração")
 	s.cancel()
 	// Aguarda um curto período para garantir que a goroutine termine
@@ -119,34 +154,103 @@ func (s *ConfigSync) runSyncLoop() {
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
 
-	log.Printf("Sincronizador configurado para executar a cada %v", s.interval)
+	// Log detalhado do início do loop de sincronização
+	if DetailedLogging {
+		log.Printf("Sincronizador configurado para executar a cada %v", s.interval)
+	}
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Println("Sincronizador de configuração finalizado")
+			s.logger.Info("ConfigSync", "Sincronizador de configuração finalizado")
 			return
 
 		case <-healthTicker.C:
 			// Verificação periódica da saúde do cache
 			if err := s.healthCheck(); err != nil {
-				log.Printf("Falha na verificação de saúde do cache: %v", err)
-				s.logger.Error("ConfigSync", fmt.Sprintf("Falha na verificação de saúde do cache: %v", err))
+				// Incrementa o contador de erros consecutivos
+				s.consecutiveErrors++
+
+				// Registra o erro apenas após vários erros consecutivos para evitar spam
+				if s.consecutiveErrors >= 3 {
+					s.logger.ErrorWithDetails("ConfigSync",
+						"Falhas persistentes na verificação de saúde do cache",
+						fmt.Sprintf("Falhas consecutivas: %d, Último erro: %v",
+							s.consecutiveErrors, err))
+				}
+			} else {
+				// Resetar contador de erros se o health check for bem-sucedido
+				s.consecutiveErrors = 0
 			}
 
 		case <-ticker.C:
 			// Evitar execuções sobrepostas com mutex
 			if !s.syncMutex.TryLock() {
-				log.Println("Sincronização já em andamento, pulando esta iteração")
+				if DetailedLogging {
+					log.Println("Sincronização já em andamento, pulando esta iteração")
+				}
 				continue
 			}
 
-			log.Println("Iniciando ciclo de sincronização inteligente")
+			// Registra a tentativa de sincronização
+			s.lastSyncAttempt = time.Now()
+
+			// Registra o início apenas em modo detalhado para evitar spam
+			if DetailedLogging {
+				log.Println("Iniciando ciclo de sincronização inteligente")
+			}
+
+			// Aplicar lógica de recuo exponencial para erros persistentes
+			if s.consecutiveErrors > 5 {
+				// Pula algumas sincronizações após muitos erros para não sobrecarregar
+				if s.consecutiveErrors < 10 && s.consecutiveErrors%2 != 0 {
+					s.syncMutex.Unlock()
+					continue
+				} else if s.consecutiveErrors >= 10 && s.consecutiveErrors < 20 && s.consecutiveErrors%4 != 0 {
+					s.syncMutex.Unlock()
+					continue
+				} else if s.consecutiveErrors >= 20 && s.consecutiveErrors%8 != 0 {
+					s.syncMutex.Unlock()
+					continue
+				}
+			}
+
+			startTime := time.Now()
+
 			// Sincronização normal (não forçada)
 			if err := s.SyncAll(false); err != nil {
-				log.Printf("Erro na sincronização: %v", err)
-				s.logger.Error("ConfigSync", fmt.Sprintf("Erro na sincronização: %v", err))
+				// Incrementar contador de falhas
+				s.consecutiveErrors++
+				s.syncStats.FailedSyncs++
+				s.syncStats.LastError = err.Error()
+
+				// Registar o erro apenas em falhas significativas para reduzir spam
+				if s.consecutiveErrors >= 3 || DetailedLogging {
+					s.logger.ErrorWithDetails("ConfigSync",
+						"Falha na sincronização periódica",
+						fmt.Sprintf("Tentativa: %d, Erro: %v", s.syncStats.TotalSyncs, err))
+				}
+			} else {
+				// Sucesso - resetar contador de erros e atualizar estatísticas
+				s.syncStats.SuccessfulSyncs++
+				s.syncStats.LastDuration = time.Since(startTime)
+				s.syncStats.AverageDuration = (s.syncStats.AverageDuration*time.Duration(s.syncStats.SuccessfulSyncs-1) +
+					s.syncStats.LastDuration) / time.Duration(s.syncStats.SuccessfulSyncs)
+				s.lastSuccessfulSync = time.Now()
+				s.consecutiveErrors = 0
+
+				// Registrar sucesso apenas ocasionalmente para reduzir volume de logs
+				if s.syncStats.SuccessfulSyncs%10 == 0 || DetailedLogging {
+					s.logger.InfoWithDetails("ConfigSync",
+						"Sincronização periódica bem-sucedida",
+						fmt.Sprintf("Sincronização #%d, Duração: %v, PLCs atualizados: %d, Tags atualizadas: %d",
+							s.syncStats.SuccessfulSyncs, s.syncStats.LastDuration,
+							s.syncStats.TotalPLCsUpdated, s.syncStats.TotalTagsUpdated))
+				}
 			}
+
+			// Incrementar contador geral de sincronizações
+			s.syncStats.TotalSyncs++
 
 			s.syncMutex.Unlock()
 		}
@@ -164,18 +268,36 @@ func (s *ConfigSync) SyncAll(forceSync bool) error {
 	ctx, cancel := context.WithTimeout(s.ctx, 45*time.Second)
 	defer cancel()
 
+	// Variáveis para rastreamento de atualizações
+	var plcsUpdated, tagsUpdated int
+	startTime := time.Now()
+
 	// Sincroniza PLCs com verificação de alterações
-	if err := s.SyncPLCs(ctx, forceSync); err != nil {
+	plcsCount, err := s.SyncPLCs(ctx, forceSync)
+	if err != nil {
 		return fmt.Errorf("erro ao sincronizar PLCs: %w", err)
 	}
+	plcsUpdated = plcsCount
 
 	// Sincroniza Tags com verificação de alterações
-	if err := s.SyncTags(ctx, forceSync); err != nil {
+	tagsCount, err := s.SyncTags(ctx, forceSync)
+	if err != nil {
 		return fmt.Errorf("erro ao sincronizar Tags: %w", err)
 	}
+	tagsUpdated = tagsCount
 
-	log.Println("Sincronização de configuração concluída com sucesso")
-	s.logger.Info("ConfigSync", "Sincronização concluída com sucesso")
+	// Atualiza estatísticas
+	s.syncStats.TotalPLCsUpdated += plcsUpdated
+	s.syncStats.TotalTagsUpdated += tagsUpdated
+
+	// Registra conclusão apenas se houve mudanças ou em modo detalhado
+	if plcsUpdated > 0 || tagsUpdated > 0 || DetailedLogging {
+		s.logger.InfoWithDetails("ConfigSync",
+			"Sincronização concluída com atualizações",
+			fmt.Sprintf("PLCs atualizados: %d, Tags atualizadas: %d, Tempo: %v",
+				plcsUpdated, tagsUpdated, time.Since(startTime)))
+	}
+
 	return nil
 }
 
@@ -191,27 +313,28 @@ func calculateHash(data interface{}) (string, error) {
 }
 
 // SyncPLCs sincroniza PLCs do PostgreSQL para o Redis
-func (s *ConfigSync) SyncPLCs(ctx context.Context, forceSync bool) error {
-	log.Println("Sincronizando PLCs...")
+func (s *ConfigSync) SyncPLCs(ctx context.Context, forceSync bool) (int, error) {
+	if DetailedLogging {
+		log.Println("Sincronizando PLCs...")
+	}
 
 	// Primeiro obtém os dados do banco
 	dbWithTimeout := s.db.WithTimeout(20 * time.Second)
 	plcs, err := dbWithTimeout.GetActivePLCs()
 	if err != nil {
-		return fmt.Errorf("erro ao obter PLCs ativos: %w", err)
+		return 0, fmt.Errorf("erro ao obter PLCs ativos: %w", err)
 	}
 
 	// Verifica se há PLCs para sincronizar
 	if len(plcs) == 0 {
-		log.Println("Nenhum PLC ativo encontrado no banco de dados")
-		s.logger.Warn("ConfigSync", "Nenhum PLC ativo encontrado no banco de dados")
-		return nil
+		s.logger.Debug("ConfigSync", "Nenhum PLC ativo encontrado no banco de dados")
+		return 0, nil
 	}
 
 	// Calcula o hash dos dados dos PLCs para detectar mudanças
 	currentHash, err := calculateHash(plcs)
 	if err != nil {
-		return fmt.Errorf("erro ao calcular hash dos PLCs: %w", err)
+		return 0, fmt.Errorf("erro ao calcular hash dos PLCs: %w", err)
 	}
 
 	// Verifica se houve mudanças comparando com o hash armazenado
@@ -219,68 +342,92 @@ func (s *ConfigSync) SyncPLCs(ctx context.Context, forceSync bool) error {
 	dataChanged := forceSync || (storedHash != currentHash)
 
 	if !dataChanged {
-		log.Println("Dados de PLCs não mudaram desde a última sincronização")
-		return nil
+		// Nenhuma mudança detectada
+		if DetailedLogging {
+			log.Println("Dados de PLCs não mudaram desde a última sincronização")
+		}
+		return 0, nil
 	}
 
-	log.Printf("Detectadas alterações nos dados de PLCs (forceSync: %v, hashDiff: %v)",
-		forceSync, storedHash != currentHash)
+	if DetailedLogging {
+		log.Printf("Detectadas alterações nos dados de PLCs (forceSync: %v, hashDiff: %v)",
+			forceSync, storedHash != currentHash)
+	}
 
 	// Prossegue com a sincronização já que os dados mudaram
 	allPlcsKey := "config:plcs:all"
 	plcsJSON, err := json.Marshal(plcs)
 	if err != nil {
-		return fmt.Errorf("erro ao serializar PLCs: %w", err)
+		return 0, fmt.Errorf("erro ao serializar PLCs: %w", err)
 	}
 
 	// Armazena em uma transação para garantir atomicidade
 	if err := s.safeStoreValue(allPlcsKey, string(plcsJSON)); err != nil {
-		return fmt.Errorf("erro ao armazenar lista de PLCs: %w", err)
+		return 0, fmt.Errorf("erro ao armazenar lista de PLCs: %w", err)
 	}
 
-	log.Printf("Dados de %d PLCs sincronizados no cache com chave '%s'", len(plcs), allPlcsKey)
+	if DetailedLogging {
+		log.Printf("Dados de %d PLCs sincronizados no cache com chave '%s'", len(plcs), allPlcsKey)
+	}
 
 	// Armazena cada PLC individualmente e rastreia PLCs processados
 	processedIDs := make(map[int]bool)
 	for _, plc := range plcs {
 		plcJSON, err := json.Marshal(plc)
 		if err != nil {
-			log.Printf("Erro ao serializar PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro ao serializar PLC %d: %v", plc.ID, err)
+			}
 			continue
 		}
 
 		// Chave para cada PLC individual
 		plcKey := fmt.Sprintf("config:plc:%d", plc.ID)
 		if err := s.safeStoreValue(plcKey, string(plcJSON)); err != nil {
-			log.Printf("Erro ao armazenar PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro ao armazenar PLC %d: %v", plc.ID, err)
+			}
 			continue
 		}
 
-		log.Printf("PLC ID %d (%s) sincronizado com sucesso", plc.ID, plc.Name)
+		if DetailedLogging {
+			log.Printf("PLC ID %d (%s) sincronizado com sucesso", plc.ID, plc.Name)
+		}
+
 		processedIDs[plc.ID] = true
 
 		// Registra o status do PLC se disponível
 		if plc.Status != "" {
 			statusKey := fmt.Sprintf("config:plc:%d:status", plc.ID)
 			if err := s.cache.SetValue(statusKey, plc.Status); err == nil {
-				log.Printf("Status do PLC ID %d (%s) sincronizado: %s", plc.ID, plc.Name, plc.Status)
+				if DetailedLogging {
+					log.Printf("Status do PLC ID %d (%s) sincronizado: %s", plc.ID, plc.Name, plc.Status)
+				}
 			}
 		}
 	}
 
 	// Armazena o hash atual para comparação futura
 	if err := s.cache.SetValue(KeyConfigPLCsHash, currentHash); err != nil {
-		log.Printf("Aviso: Não foi possível armazenar hash de PLCs: %v", err)
+		if DetailedLogging {
+			log.Printf("Aviso: Não foi possível armazenar hash de PLCs: %v", err)
+		}
 	}
 
 	// Armazena o timestamp da última sincronização
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	if err := s.cache.SetValue(KeyConfigPLCsTime, timestamp); err != nil {
-		log.Printf("Aviso: Não foi possível armazenar timestamp de PLCs: %v", err)
+		if DetailedLogging {
+			log.Printf("Aviso: Não foi possível armazenar timestamp de PLCs: %v", err)
+		}
 	}
 
-	log.Printf("Sincronizados %d PLCs com sucesso", len(plcs))
-	return nil
+	// Registra a conclusão da sincronização
+	s.logger.InfoWithDetails("ConfigSync",
+		"Dados de PLCs sincronizados com sucesso",
+		fmt.Sprintf("PLCs atualizados: %d", len(plcs)))
+
+	return len(plcs), nil
 }
 
 // safeStoreValue armazena um valor no cache de forma segura, com verificação
@@ -318,20 +465,24 @@ func (s *ConfigSync) safeStoreValue(key string, value string) error {
 }
 
 // SyncTags sincroniza as tags do PostgreSQL para o Redis
-func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) error {
-	log.Println("Sincronizando Tags...")
+func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) (int, error) {
+	if DetailedLogging {
+		log.Println("Sincronizando Tags...")
+	}
 
 	// Obtém todos os PLCs
 	dbWithTimeout := s.db.WithTimeout(30 * time.Second)
 	plcs, err := dbWithTimeout.GetActivePLCs()
 	if err != nil {
-		return fmt.Errorf("erro ao obter PLCs ativos para sincronização de tags: %w", err)
+		return 0, fmt.Errorf("erro ao obter PLCs ativos para sincronização de tags: %w", err)
 	}
 
 	// Se não há PLCs, não há tags para sincronizar
 	if len(plcs) == 0 {
-		log.Println("Nenhum PLC ativo encontrado para sincronizar tags")
-		return nil
+		if DetailedLogging {
+			log.Println("Nenhum PLC ativo encontrado para sincronizar tags")
+		}
+		return 0, nil
 	}
 
 	totalTags := 0
@@ -342,29 +493,38 @@ func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) error {
 		// Verifica se devemos sincronizar este PLC específico
 		shouldSync, err := s.shouldSyncTagsForPLC(plc.ID, forceSync)
 		if err != nil {
-			log.Printf("Erro ao verificar necessidade de sincronização para PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro ao verificar necessidade de sincronização para PLC %d: %v", plc.ID, err)
+			}
 			// Em caso de erro, continuamos com a sincronização por segurança
 			shouldSync = true
 		}
 
 		if !shouldSync {
-			log.Printf("Tags do PLC %s (ID: %d) estão atualizadas, pulando sincronização", plc.Name, plc.ID)
+			if DetailedLogging {
+				log.Printf("Tags do PLC %s (ID: %d) estão atualizadas, pulando sincronização", plc.Name, plc.ID)
+			}
 			continue
 		}
 
 		// Início da sincronização para este PLC
-		log.Printf("====== Sincronizando tags do PLC %s (ID: %d)... ======", plc.Name, plc.ID)
+		if DetailedLogging {
+			log.Printf("====== Sincronizando tags do PLC %s (ID: %d)... ======", plc.Name, plc.ID)
+		}
 
 		// Obtém as tags com um timeout específico
 		dbForTags := s.db.WithTimeout(30 * time.Second)
 		tags, err := dbForTags.GetPLCTags(plc.ID)
 		if err != nil {
-			log.Printf("Erro ao obter tags do PLC %d: %v", plc.ID, err)
-			s.logger.Error("ConfigSync", fmt.Sprintf("Erro ao obter tags do PLC %d: %v", plc.ID, err))
+			s.logger.ErrorWithDetails("ConfigSync",
+				fmt.Sprintf("Erro ao obter tags do PLC %s", plc.Name),
+				fmt.Sprintf("PLC ID: %d, Erro: %v", plc.ID, err))
 			continue
 		}
 
-		log.Printf("Obtidas %d tags do banco de dados para o PLC %s", len(tags), plc.Name)
+		if DetailedLogging {
+			log.Printf("Obtidas %d tags do banco de dados para o PLC %s", len(tags), plc.Name)
+		}
 
 		// Filtra apenas tags ativas
 		var activeTags []database.Tag
@@ -374,18 +534,24 @@ func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) error {
 			}
 		}
 
-		log.Printf("Filtradas %d tags ativas para o PLC %s", len(activeTags), plc.Name)
+		if DetailedLogging {
+			log.Printf("Filtradas %d tags ativas para o PLC %s", len(activeTags), plc.Name)
+		}
 
 		// Calcula o hash das tags para detectar mudanças
 		currentHash, err := calculateHash(activeTags)
 		if err != nil {
-			log.Printf("Erro ao calcular hash das tags do PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro ao calcular hash das tags do PLC %d: %v", plc.ID, err)
+			}
 			// Em caso de erro, prosseguimos com a sincronização
 		} else {
 			// Armazena o hash para verificações futuras
 			hashKey := fmt.Sprintf(KeyConfigTagsHash, plc.ID)
 			if err := s.cache.SetValue(hashKey, currentHash); err != nil {
-				log.Printf("Aviso: Não foi possível armazenar hash de tags do PLC %d: %v", plc.ID, err)
+				if DetailedLogging {
+					log.Printf("Aviso: Não foi possível armazenar hash de tags do PLC %d: %v", plc.ID, err)
+				}
 			}
 		}
 
@@ -395,48 +561,64 @@ func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) error {
 		// Mesmo se não houver tags ativas, armazenamos um array vazio
 		if len(activeTags) == 0 {
 			if err := s.safeStoreValue(tagsKey, "[]"); err != nil {
-				log.Printf("Erro ao armazenar array vazio para PLC %d: %v", plc.ID, err)
+				if DetailedLogging {
+					log.Printf("Erro ao armazenar array vazio para PLC %d: %v", plc.ID, err)
+				}
 				continue
 			}
-			log.Printf("Array vazio de tags armazenado para PLC %d", plc.ID)
+			if DetailedLogging {
+				log.Printf("Array vazio de tags armazenado para PLC %d", plc.ID)
+			}
 			continue
 		}
 
 		// Serializa as tags ativas
 		tagsJSON, err := json.Marshal(activeTags)
 		if err != nil {
-			log.Printf("Erro ao serializar tags do PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro ao serializar tags do PLC %d: %v", plc.ID, err)
+			}
 			continue
 		}
 
 		// Armazena a lista completa de tags com método seguro
 		if err := s.safeStoreValue(tagsKey, string(tagsJSON)); err != nil {
-			log.Printf("Erro fatal ao armazenar tags do PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Erro fatal ao armazenar tags do PLC %d: %v", plc.ID, err)
+			}
 			continue
 		}
 
-		log.Printf("Lista completa de %d tags sincronizada para PLC %d", len(activeTags), plc.ID)
+		if DetailedLogging {
+			log.Printf("Lista completa de %d tags sincronizada para PLC %d", len(activeTags), plc.ID)
+		}
 		syncsPerformed++
 
 		// Armazena cada tag individualmente para acesso rápido
 		for _, tag := range activeTags {
 			tagJSON, err := json.Marshal(tag)
 			if err != nil {
-				log.Printf("Erro ao serializar tag %d: %v", tag.ID, err)
+				if DetailedLogging {
+					log.Printf("Erro ao serializar tag %d: %v", tag.ID, err)
+				}
 				continue
 			}
 
 			// Chave para tag específica
 			tagKey := fmt.Sprintf("config:plc:%d:tag:%d", plc.ID, tag.ID)
 			if err := s.cache.SetValue(tagKey, string(tagJSON)); err != nil {
-				log.Printf("Erro ao armazenar tag %d: %v", tag.ID, err)
+				if DetailedLogging {
+					log.Printf("Erro ao armazenar tag %d: %v", tag.ID, err)
+				}
 				continue
 			}
 
 			// Chave para busca por nome
 			nameKey := fmt.Sprintf("config:plc:%d:tagname:%s", plc.ID, tag.Name)
 			if err := s.cache.SetValue(nameKey, fmt.Sprintf("%d", tag.ID)); err != nil {
-				log.Printf("Erro ao armazenar mapeamento de nome da tag %s: %v", tag.Name, err)
+				if DetailedLogging {
+					log.Printf("Erro ao armazenar mapeamento de nome da tag %s: %v", tag.Name, err)
+				}
 				continue
 			}
 		}
@@ -445,20 +627,31 @@ func (s *ConfigSync) SyncTags(ctx context.Context, forceSync bool) error {
 		timeKey := fmt.Sprintf(KeyConfigTagsTime, plc.ID)
 		timestamp := fmt.Sprintf("%d", time.Now().Unix())
 		if err := s.cache.SetValue(timeKey, timestamp); err != nil {
-			log.Printf("Aviso: Não foi possível armazenar timestamp de tags do PLC %d: %v", plc.ID, err)
+			if DetailedLogging {
+				log.Printf("Aviso: Não foi possível armazenar timestamp de tags do PLC %d: %v", plc.ID, err)
+			}
 		}
 
-		log.Printf("Sincronizadas %d tags para o PLC %s (ID: %d)", len(activeTags), plc.Name, plc.ID)
+		if DetailedLogging {
+			log.Printf("Sincronizadas %d tags para o PLC %s (ID: %d)", len(activeTags), plc.Name, plc.ID)
+		}
 		totalTags += len(activeTags)
 	}
 
+	// Log final resumido
 	if syncsPerformed == 0 {
-		log.Println("Não foi necessário sincronizar tags para nenhum PLC - todos estão atualizados")
+		if DetailedLogging {
+			log.Println("Não foi necessário sincronizar tags para nenhum PLC - todos estão atualizados")
+		}
+		return 0, nil
 	} else {
-		log.Printf("Sincronização completa: %d tags em %d PLCs", totalTags, syncsPerformed)
-	}
+		// Registra a sincronização apenas se houve atualizações
+		s.logger.InfoWithDetails("ConfigSync",
+			"Tags sincronizadas com sucesso",
+			fmt.Sprintf("Total: %d tags em %d PLCs", totalTags, syncsPerformed))
 
-	return nil
+		return totalTags, nil
+	}
 }
 
 // shouldSyncTagsForPLC verifica se as tags de um PLC precisam ser sincronizadas
@@ -532,12 +725,31 @@ func (s *ConfigSync) GetSyncStatus() map[string]interface{} {
 	}
 	status["cache_health"] = cacheHealth
 
+	// Status atualização
+	status["last_sync_attempt"] = s.lastSyncAttempt.Format(time.RFC3339)
+	if !s.lastSuccessfulSync.IsZero() {
+		status["last_successful_sync"] = s.lastSuccessfulSync.Format(time.RFC3339)
+		status["seconds_since_last_sync"] = time.Since(s.lastSuccessfulSync).Seconds()
+	}
+
+	// Estatísticas
+	status["total_syncs"] = s.syncStats.TotalSyncs
+	status["successful_syncs"] = s.syncStats.SuccessfulSyncs
+	status["failed_syncs"] = s.syncStats.FailedSyncs
+	status["average_duration_ms"] = s.syncStats.AverageDuration.Milliseconds()
+	status["last_duration_ms"] = s.syncStats.LastDuration.Milliseconds()
+	status["consecutive_errors"] = s.consecutiveErrors
+
+	if s.syncStats.LastError != "" {
+		status["last_error"] = s.syncStats.LastError
+	}
+
 	// Obtém timestamp da última sincronização de PLCs
 	plcTimeStr, _ := s.cache.GetValue(KeyConfigPLCsTime)
 	if plcTimeStr != "" {
 		plcTime, err := strconv.ParseInt(plcTimeStr, 10, 64)
 		if err == nil {
-			status["plcs_last_sync"] = time.Unix(plcTime, 0).String()
+			status["plcs_last_sync"] = time.Unix(plcTime, 0).Format(time.RFC3339)
 			status["plcs_seconds_ago"] = time.Now().Unix() - plcTime
 		}
 	}
@@ -552,7 +764,7 @@ func (s *ConfigSync) GetSyncStatus() map[string]interface{} {
 			timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 			if err == nil {
 				tagsStatus[plc.Name] = map[string]interface{}{
-					"last_sync":   time.Unix(timestamp, 0).String(),
+					"last_sync":   time.Unix(timestamp, 0).Format(time.RFC3339),
 					"seconds_ago": time.Now().Unix() - timestamp,
 				}
 			}
@@ -561,4 +773,14 @@ func (s *ConfigSync) GetSyncStatus() map[string]interface{} {
 	status["tags_sync"] = tagsStatus
 
 	return status
+}
+
+// SetDetailedLogging permite ativar ou desativar logs detalhados
+func SetDetailedLogging(enabled bool) {
+	DetailedLogging = enabled
+	if enabled {
+		log.Println("ConfigSync: Logs detalhados ATIVADOS")
+	} else {
+		log.Println("ConfigSync: Logs detalhados DESATIVADOS")
+	}
 }
