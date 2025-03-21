@@ -53,35 +53,65 @@ func (p *ConnectionPool) GetConnection(ip string, rack, slot int) (*Client, erro
 	client, exists := p.connections[key]
 	if exists {
 		lastUse := p.lastUsed[key]
-		// Verifica se a conexão expirou
-		if time.Since(lastUse) > p.maxAge {
+
+		// Verificar se a conexão está saudável com um ping rápido
+		if err := client.Ping(); err != nil {
+			// Conexão quebrada, vamos tentar reconectar
 			p.mutex.RUnlock()
-			// Se expirou, remove e cria uma nova
 			p.mutex.Lock()
 			defer p.mutex.Unlock()
 
-			// Verifica novamente após obter o lock exclusivo
-			if client, exists = p.connections[key]; exists {
-				if time.Since(p.lastUsed[key]) > p.maxAge {
+			// Verifica novamente após obter lock exclusivo
+			client, exists = p.connections[key]
+			if exists {
+				// Tentar reconectar
+				if err := client.Reconnect(); err != nil {
+					log.Printf("Pool: Conexão %s falhou ao reconectar, criando nova: %v", key, err)
+					// Falha na reconexão, remover e criar nova
 					client.Close()
 					delete(p.connections, key)
 					delete(p.lastUsed, key)
 					exists = false
+				} else {
+					// Reconexão bem-sucedida
+					log.Printf("Pool: Reconexão bem-sucedida para %s", key)
+					p.lastUsed[key] = time.Now()
+					return client, nil
 				}
 			}
 		} else {
-			// Atualiza o tempo de último uso
-			p.mutex.RUnlock()
-			p.mutex.Lock()
-			p.lastUsed[key] = time.Now()
-			p.mutex.Unlock()
-			return client, nil
+			// Conexão OK, atualiza timestamp e retorna
+			// Verifica se a conexão expirou
+			if time.Since(lastUse) > p.maxAge {
+				p.mutex.RUnlock()
+				// Se expirou, remove e cria uma nova
+				p.mutex.Lock()
+				defer p.mutex.Unlock()
+
+				// Verifica novamente após obter o lock exclusivo
+				if client, exists = p.connections[key]; exists {
+					if time.Since(p.lastUsed[key]) > p.maxAge {
+						client.Close()
+						delete(p.connections, key)
+						delete(p.lastUsed, key)
+						exists = false
+					}
+				}
+			} else {
+				// Atualiza o tempo de último uso
+				p.mutex.RUnlock()
+				p.mutex.Lock()
+				p.lastUsed[key] = time.Now()
+				p.mutex.Unlock()
+				return client, nil
+			}
 		}
 	} else {
 		p.mutex.RUnlock()
 	}
 
-	// Se não existe ou expirou, cria uma nova conexão
+	// Se não existe ou está quebrada, cria uma nova
+	log.Printf("Pool: Criando nova conexão para %s", key)
 	newClient, err := NewClient(ip, rack, slot)
 	if err != nil {
 		return nil, err
@@ -106,29 +136,56 @@ func (p *ConnectionPool) GetConnectionWithConfig(config ClientConfig) (*Client, 
 	client, exists := p.connections[key]
 	if exists {
 		lastUse := p.lastUsed[key]
-		// Verifica se a conexão expirou
-		if time.Since(lastUse) > p.maxAge {
+
+		// Verificar se a conexão está saudável com um ping rápido
+		if err := client.Ping(); err != nil {
+			// Conexão quebrada, vamos tentar reconectar
 			p.mutex.RUnlock()
-			// Se expirou, remove e cria uma nova
 			p.mutex.Lock()
 			defer p.mutex.Unlock()
 
-			// Verifica novamente após obter o lock exclusivo
-			if client, exists = p.connections[key]; exists {
-				if time.Since(p.lastUsed[key]) > p.maxAge {
+			// Verifica novamente após obter lock exclusivo
+			client, exists = p.connections[key]
+			if exists {
+				// Tentar reconectar
+				if err := client.Reconnect(); err != nil {
+					log.Printf("Pool: Conexão %s falhou ao reconectar, criando nova: %v", key, err)
+					// Falha na reconexão, remover e criar nova
 					client.Close()
 					delete(p.connections, key)
 					delete(p.lastUsed, key)
 					exists = false
+				} else {
+					// Reconexão bem-sucedida
+					log.Printf("Pool: Reconexão bem-sucedida para %s", key)
+					p.lastUsed[key] = time.Now()
+					return client, nil
 				}
 			}
 		} else {
-			// Atualiza o tempo de último uso
-			p.mutex.RUnlock()
-			p.mutex.Lock()
-			p.lastUsed[key] = time.Now()
-			p.mutex.Unlock()
-			return client, nil
+			// Verificar se a conexão expirou
+			if time.Since(lastUse) > p.maxAge {
+				p.mutex.RUnlock()
+				p.mutex.Lock()
+				defer p.mutex.Unlock()
+
+				// Verificar novamente após obter o lock exclusivo
+				if client, exists = p.connections[key]; exists {
+					if time.Since(p.lastUsed[key]) > p.maxAge {
+						client.Close()
+						delete(p.connections, key)
+						delete(p.lastUsed, key)
+						exists = false
+					}
+				}
+			} else {
+				// Conexão ainda válida, atualizar timestamp e retornar
+				p.mutex.RUnlock()
+				p.mutex.Lock()
+				p.lastUsed[key] = time.Now()
+				p.mutex.Unlock()
+				return client, nil
+			}
 		}
 	} else {
 		p.mutex.RUnlock()
@@ -196,15 +253,57 @@ func (p *ConnectionPool) Close() {
 	log.Println("Pool de conexões PLC encerrado")
 }
 
+// VerifyConnections verifica e reinicia conexões quebradas
+func (p *ConnectionPool) VerifyConnections() int {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	restarted := 0
+	now := time.Now()
+
+	for key, client := range p.connections {
+		// Verificar se a conexão está ativa
+		if err := client.Ping(); err != nil {
+			log.Printf("Pool: Conexão %s falhou no ping: %v", key, err)
+
+			// Tentar reconectar
+			if err := client.Reconnect(); err != nil {
+				log.Printf("Pool: Falha ao reconectar %s: %v", key, err)
+
+				// Se falhar na reconexão, remove do pool
+				client.Close()
+				delete(p.connections, key)
+				delete(p.lastUsed, key)
+			} else {
+				log.Printf("Pool: Reconectou com sucesso %s", key)
+				// Atualiza o timestamp
+				p.lastUsed[key] = now
+				restarted++
+			}
+		}
+	}
+
+	return restarted
+}
+
 // cleanupRoutine verifica periodicamente conexões não utilizadas
 func (p *ConnectionPool) cleanupRoutine() {
 	ticker := time.NewTicker(5 * time.Minute)
+	healthCheckTicker := time.NewTicker(30 * time.Second) // Verificação de saúde mais frequente
 	defer ticker.Stop()
+	defer healthCheckTicker.Stop()
 
 	for {
 		select {
 		case <-p.stopChan:
 			return
+
+		case <-healthCheckTicker.C:
+			// Verificação de saúde das conexões ativas
+			fixed := p.VerifyConnections()
+			if fixed > 0 {
+				log.Printf("Pool: Verificação de saúde reconectou %d conexões", fixed)
+			}
 
 		case <-ticker.C:
 			p.mutex.Lock()

@@ -16,16 +16,17 @@ import (
 
 // Manager controla a gerência de PLCs e suas tags
 type Manager struct {
-	db            *database.DB
-	cache         cache.Cache
-	logger        *database.Logger
-	plcPool       *plclib.ConnectionPool // Novo campo para pool de conexões
-	plcCancels    map[int]context.CancelFunc
-	mutex         sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	checkInterval time.Duration
-	wg            sync.WaitGroup // Para encerramento gracioso
+	db               *database.DB
+	cache            cache.Cache
+	logger           *database.Logger
+	plcPool          *plclib.ConnectionPool // Novo campo para pool de conexões
+	plcCancels       map[int]context.CancelFunc
+	mutex            sync.RWMutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	checkInterval    time.Duration
+	watchdogInterval time.Duration  // Intervalo para o watchdog verificar conexões
+	wg               sync.WaitGroup // Para encerramento gracioso
 }
 
 // NewManager cria uma nova instância do gerenciador de PLCs
@@ -34,15 +35,16 @@ func NewManager(ctx context.Context, db *database.DB, cacheProvider cache.Cache,
 	ctx, cancel := context.WithCancel(ctx)
 
 	return &Manager{
-		db:            db,
-		cache:         cacheProvider,
-		logger:        logger,
-		plcPool:       plcPool,
-		plcCancels:    make(map[int]context.CancelFunc),
-		mutex:         sync.RWMutex{},
-		ctx:           ctx,
-		cancel:        cancel,
-		checkInterval: 5 * time.Second,
+		db:               db,
+		cache:            cacheProvider,
+		logger:           logger,
+		plcPool:          plcPool,
+		plcCancels:       make(map[int]context.CancelFunc),
+		mutex:            sync.RWMutex{},
+		ctx:              ctx,
+		cancel:           cancel,
+		checkInterval:    5 * time.Second,
+		watchdogInterval: 30 * time.Second, // Intervalo para verificação de conexões
 	}
 }
 
@@ -71,6 +73,9 @@ func (m *Manager) Start() error {
 		m.runPLCManager()
 	}()
 
+	// Iniciar o watchdog
+	m.startWatchdog()
+
 	return nil
 }
 
@@ -95,6 +100,139 @@ func (m *Manager) Stop() {
 	case <-time.After(5 * time.Second):
 		log.Println("Timeout ao aguardar término de goroutines do gerenciador de PLCs")
 	}
+}
+
+// startWatchdog inicia o watchdog para monitorar e reiniciar conexões
+func (m *Manager) startWatchdog() {
+	log.Println("Iniciando watchdog para monitorar conexões PLC")
+	ticker := time.NewTicker(m.watchdogInterval)
+	defer ticker.Stop()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+
+		for {
+			select {
+			case <-m.ctx.Done():
+				log.Println("Watchdog encerrado")
+				return
+
+			case <-ticker.C:
+				// Verificar conexões de todos os PLCs gerenciados
+				m.checkAndRestartConnections()
+			}
+		}
+	}()
+}
+
+// checkAndRestartConnections verifica e reinicia conexões
+func (m *Manager) checkAndRestartConnections() {
+	// Obtém a lista de PLCs do cache
+	plcsJSON, err := m.cache.GetValue("config:plcs:all")
+	if err != nil || plcsJSON == "" {
+		log.Printf("Watchdog: Erro ao obter lista de PLCs do cache: %v", err)
+		// Fallback para banco de dados
+		plcs, dbErr := m.db.GetActivePLCs()
+		if dbErr != nil {
+			log.Printf("Watchdog: Erro ao obter PLCs do banco de dados: %v", dbErr)
+			return
+		}
+		m.checkPLCConnections(plcs)
+		return
+	}
+
+	// Deserializar os PLCs do JSON
+	var plcs []database.PLC
+	if err := json.Unmarshal([]byte(plcsJSON), &plcs); err != nil {
+		log.Printf("Watchdog: Erro ao deserializar PLCs: %v", err)
+		// Fallback para banco de dados
+		plcs, dbErr := m.db.GetActivePLCs()
+		if dbErr != nil {
+			log.Printf("Watchdog: Erro ao obter PLCs do banco de dados: %v", dbErr)
+			return
+		}
+		m.checkPLCConnections(plcs)
+		return
+	}
+
+	// Verificar cada PLC
+	m.checkPLCConnections(plcs)
+}
+
+// checkPLCConnections verifica conexões para uma lista de PLCs
+func (m *Manager) checkPLCConnections(plcs []database.PLC) {
+	for _, plc := range plcs {
+		if !plc.Active {
+			continue
+		}
+
+		// Verificar se o PLC tem status 'offline'
+		status, err := m.cache.GetValue(fmt.Sprintf("config:plc:%d:status", plc.ID))
+		if err == nil && status == "offline" {
+			log.Printf("Watchdog: PLC %s (ID=%d) está offline, tentando reiniciar",
+				plc.Name, plc.ID)
+
+			// Forçar ping para verificar status real
+			newStatus, err := m.ForcePingPLC(plc.ID)
+			if err != nil {
+				log.Printf("Watchdog: Erro ao verificar conexão com PLC %s: %v",
+					plc.Name, err)
+				continue
+			}
+
+			if newStatus == "online" {
+				log.Printf("Watchdog: PLC %s (ID=%d) voltou a ficar online!",
+					plc.Name, plc.ID)
+
+				// Reiniciar monitoramento
+				m.restartPLCMonitoring(plc.ID)
+			}
+		}
+	}
+}
+
+// restartPLCMonitoring reinicia o monitoramento de um PLC específico
+func (m *Manager) restartPLCMonitoring(plcID int) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	// Verificar se temos um cancelFunc para este PLC
+	if cancelFunc, exists := m.plcCancels[plcID]; exists {
+		// Cancela a goroutine atual
+		cancelFunc()
+		delete(m.plcCancels, plcID)
+
+		log.Printf("Cancelado monitoramento existente do PLC ID %d para reinício", plcID)
+	}
+
+	// Buscar PLC atualizado
+	plcConfig, err := m.db.GetPLCByID(plcID)
+	if err != nil {
+		log.Printf("Erro ao buscar PLC ID %d para reinício: %v", plcID, err)
+		m.logger.Error("Watchdog", fmt.Sprintf("Erro ao reiniciar PLC ID %d: %v", plcID, err))
+		return
+	}
+
+	if !plcConfig.Active {
+		log.Printf("PLC ID %d não está mais ativo, não reiniciará", plcID)
+		return
+	}
+
+	// Iniciar uma nova goroutine para monitorar este PLC
+	plcCtx, plcCancel := context.WithCancel(m.ctx)
+	m.plcCancels[plcID] = plcCancel
+
+	m.wg.Add(1)
+	go func(ctx context.Context, config database.PLC) {
+		defer m.wg.Done()
+		m.runPLC(ctx, config)
+	}(plcCtx, *plcConfig)
+
+	log.Printf("Reiniciado monitoramento do PLC %s (ID: %d)",
+		plcConfig.Name, plcConfig.ID)
+	m.logger.Info("Watchdog", fmt.Sprintf("Reiniciado PLC %s (ID: %d)",
+		plcConfig.Name, plcConfig.ID))
 }
 
 // runPLCManager é a goroutine principal que gerencia a lista de PLCs ativos

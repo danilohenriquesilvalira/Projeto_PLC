@@ -6,8 +6,9 @@ import (
 	"math"
 )
 
-// ReadTag lê um valor do PLC usando DBNumber, ByteOffset, e BitOffset opcional (para bool)
-func (c *Client) ReadTag(dbNumber int, byteOffset int, dataType string, bitOffset int) (interface{}, error) {
+// ReadTagImpl lê um valor do PLC usando DBNumber, ByteOffset, e BitOffset opcional (para bool)
+// Esta é a implementação real que será chamada pelo método ReadTag em client.go
+func (c *Client) ReadTagImpl(dbNumber int, byteOffset int, dataType string, bitOffset int) (interface{}, error) {
 	var size int
 
 	// Determinar o tamanho baseado no tipo de dado

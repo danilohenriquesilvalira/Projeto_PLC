@@ -6,8 +6,9 @@ import (
 	"math"
 )
 
-// WriteTag escreve um valor no PLC
-func (c *Client) WriteTag(dbNumber int, byteOffset float64, dataType string, value interface{}) error {
+// WriteTagImpl escreve um valor no PLC
+// Esta é a implementação real que será chamada pelo método WriteTag em client.go
+func (c *Client) WriteTagImpl(dbNumber int, byteOffset float64, dataType string, value interface{}) error {
 	var buf []byte
 
 	// Extrair byte real e bit offset da posição

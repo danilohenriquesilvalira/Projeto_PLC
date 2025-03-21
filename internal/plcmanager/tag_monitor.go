@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"Projeto_PLC/internal/database"
@@ -24,6 +25,31 @@ type TagConfig struct {
 type TagRunner struct {
 	cancel context.CancelFunc
 	config TagConfig
+}
+
+// isNetworkError verifica se um erro é relacionado a problemas de rede
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "forcibly closed") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "uso de um arquivo fechado") ||
+		strings.Contains(errStr, "Foi forçado o cancelamento") ||
+		strings.Contains(errStr, "wsasend")
+}
+
+// minDuration retorna a menor das duas durações
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // SetDetailedLogging ativa ou desativa logs detalhados
@@ -220,7 +246,7 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 		return
 	}
 
-	// CORREÇÃO: Converter ByteOffset de float64 para int
+	// Converter ByteOffset de float64 para int
 	byteOffset := int(tag.ByteOffset)
 	bitOffset := tag.BitOffset
 
@@ -240,6 +266,19 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 
 	// Para rastrear mudanças
 	var lastValue interface{}
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 5 // Após 5 erros consecutivos, reporta erro crítico
+
+	// Adicionar mecanismo de recuo exponencial
+	baseDelay := config.ScanRate
+	currentDelay := baseDelay
+	maxDelay := 30 * time.Second // Máximo recuo
+
+	// Reconfigurar ticker baseado em recuo exponencial
+	resetTicker := func(delay time.Duration) {
+		ticker.Stop()
+		ticker = time.NewTicker(delay)
+	}
 
 	for {
 		select {
@@ -257,17 +296,69 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				return
 			}
 
-			// REMOVIDO: Log de tentativa de leitura (só mostra se DetailedLogging ativado)
+			// Verificar conexão com ping para tags críticas ou após erros
+			if consecutiveErrors > 0 {
+				if err := client.Ping(); err != nil {
+					log.Printf("Erro ao verificar conexão com PLC para tag %s: %v", tag.Name, err)
+
+					// Incrementar contador de erros
+					consecutiveErrors++
+
+					// Aplicar recuo exponencial
+					if currentDelay < maxDelay {
+						currentDelay = minDuration(currentDelay*2, maxDelay)
+						resetTicker(currentDelay)
+						log.Printf("Ajustando delay para %v após erro na tag %s", currentDelay, tag.Name)
+					}
+
+					// Define qualidade baixa para o valor no cache para indicar problema
+					if prevValue, _ := m.cache.GetTagValue(plcID, tag.ID); prevValue != nil {
+						_ = m.cache.SetTagValueWithQuality(plcID, tag.ID, prevValue.Value, 0)
+					}
+
+					// Verificar se atingimos o limite de erros consecutivos
+					if consecutiveErrors >= maxConsecutiveErrors {
+						log.Printf("Erro crítico após %d falhas consecutivas na tag %s",
+							consecutiveErrors, tag.Name)
+						errChan <- fmt.Errorf("erros consecutivos na tag %s: último erro: %v",
+							tag.Name, err)
+						return
+					}
+
+					continue
+				}
+
+				// Se o ping teve sucesso, resetar contador de erros e delay
+				log.Printf("Conexão restaurada para tag %s após %d erros", tag.Name, consecutiveErrors)
+				consecutiveErrors = 0
+				if currentDelay != baseDelay {
+					currentDelay = baseDelay
+					resetTicker(currentDelay)
+					log.Printf("Reset delay para %v após recuperação da tag %s", currentDelay, tag.Name)
+				}
+			}
+
+			// Log de tentativa de leitura (só mostra se DetailedLogging ativado)
 			if DetailedLogging {
 				log.Printf("Tentando ler tag %s (ID: %d) do PLC %s - DB: %d, ByteOffset: %d, BitOffset: %d, DataType: %s",
 					tag.Name, tag.ID, plcName, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
 			}
 
-			// CORREÇÃO: Passar BitOffset para a função ReadTag
+			// Tentar ler o valor, com tratamento especial para erros de rede
 			rawValue, err := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, bitOffset)
 			if err != nil {
 				log.Printf("Erro ao ler tag %s no PLC %s: %v", tag.Name, plcName, err)
 				m.logger.Error("Erro ao ler tag", fmt.Sprintf("%s: %v", tag.Name, err))
+
+				// Incrementar contador de erros consecutivos
+				consecutiveErrors++
+
+				// Aplicar recuo exponencial
+				if currentDelay < maxDelay {
+					currentDelay = minDuration(currentDelay*2, maxDelay)
+					resetTicker(currentDelay)
+					log.Printf("Ajustando delay para %v após erro na tag %s", currentDelay, tag.Name)
+				}
 
 				// Define qualidade baixa para o valor no cache para indicar problema
 				if prevValue, _ := m.cache.GetTagValue(plcID, tag.ID); prevValue != nil {
@@ -275,14 +366,31 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 					log.Printf("Qualidade da tag %s definida como 0 devido a erro de leitura", tag.Name)
 				}
 
-				if isCriticalError(err) {
-					errChan <- fmt.Errorf("erro crítico na tag %s: %v", tag.Name, err)
-					return
+				// Verificar se é um erro crítico de rede
+				if isNetworkError(err) {
+					// Se for um erro de rede e excedemos o limite, reportar como erro crítico
+					if consecutiveErrors >= maxConsecutiveErrors {
+						log.Printf("Erro crítico de rede após %d falhas consecutivas na tag %s",
+							consecutiveErrors, tag.Name)
+						errChan <- fmt.Errorf("erro crítico de rede na tag %s: %v", tag.Name, err)
+						return
+					}
 				}
+
 				continue
 			}
 
-			// MODIFICADO: Log do valor somente se DetailedLogging ativado ou se valor mudou
+			// Leitura bem-sucedida, resetar contador de erros e delay
+			if consecutiveErrors > 0 {
+				log.Printf("Leitura restaurada para tag %s após %d erros", tag.Name, consecutiveErrors)
+				consecutiveErrors = 0
+				if currentDelay != baseDelay {
+					currentDelay = baseDelay
+					resetTicker(currentDelay)
+				}
+			}
+
+			// Log do valor somente se DetailedLogging ativado ou se valor mudou
 			valueChanged := !plclib.CompareValues(lastValue, rawValue)
 			if DetailedLogging || valueChanged {
 				log.Printf("Valor lido para tag %s (ID: %d): tipo=%T, valor=%v",
@@ -308,7 +416,7 @@ func (m *Manager) runTag(ctx context.Context, plcID int, plcName string, tag dat
 				}
 			}
 
-			// Adiciona validação e processamento específico por tipo
+			// Processar o valor de acordo com o tipo de dados
 			switch tag.DataType {
 			case "bool":
 				// Garante que valores booleanos sejam tratados corretamente
@@ -453,33 +561,14 @@ func (m *Manager) GetTagValue(plcID int, tagName string) (interface{}, error) {
 		return nil, fmt.Errorf("PLC %s (ID=%d) está offline", plcConfig.Name, plcConfig.ID)
 	}
 
-	// Conecta ao PLC diretamente para leitura
-	var client *plclib.Client
-	var connectErr error
-
-	if plcConfig.UseVLAN && plcConfig.Gateway != "" {
-		config := plclib.ClientConfig{
-			IPAddress:  plcConfig.IPAddress,
-			Rack:       plcConfig.Rack,
-			Slot:       plcConfig.Slot,
-			Timeout:    10 * time.Second,
-			UseVLAN:    true,
-			Gateway:    plcConfig.Gateway,
-			SubnetMask: plcConfig.SubnetMask,
-			VLANID:     plcConfig.VLANID,
-		}
-
-		client, connectErr = plclib.NewClientWithConfig(config)
-	} else {
-		client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
-	}
-
-	if connectErr != nil {
-		return nil, fmt.Errorf("erro ao conectar ao PLC %s: %w", plcConfig.Name, connectErr)
+	// Tenta usar o getOrCreatePLCClient para obter uma conexão
+	client, err := getOrCreatePLCClient(m, plcID)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao conectar ao PLC %s: %w", plcConfig.Name, err)
 	}
 	defer client.Close()
 
-	// CORREÇÃO: Converter ByteOffset para inteiro
+	// Converter ByteOffset para inteiro
 	byteOffset := int(tag.ByteOffset)
 	bitOffset := tag.BitOffset
 
@@ -489,7 +578,7 @@ func (m *Manager) GetTagValue(plcID int, tagName string) (interface{}, error) {
 			tag.Name, plcConfig.Name, tag.DBNumber, byteOffset, bitOffset, tag.DataType)
 	}
 
-	// CORREÇÃO: Passar BitOffset para a função ReadTag
+	// Ler o valor do PLC
 	rawValue, err := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, bitOffset)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao ler a tag %s do PLC: %w", tagName, err)
@@ -566,7 +655,7 @@ func (m *Manager) GetAllPLCTags(plcID int) (map[string]interface{}, error) {
 					if client, err := getOrCreatePLCClient(m, plcID); err == nil && client != nil {
 						defer client.Close()
 
-						// CORREÇÃO: Converter ByteOffset para inteiro e passar BitOffset
+						// Converter ByteOffset para inteiro e passar BitOffset
 						byteOffset := int(tag.ByteOffset)
 						correctedValue, readErr := client.ReadTag(tag.DBNumber, byteOffset, tag.DataType, tag.BitOffset)
 
@@ -662,33 +751,10 @@ func (m *Manager) TestReadTag(plcID int, tagID int) (interface{}, error) {
 		return nil, fmt.Errorf("tag ID %d não pertence ao PLC ID %d", tagID, plcID)
 	}
 
-	// Conectar ao PLC diretamente para leitura de teste
-	var client *plclib.Client
-	var connectErr error
-
-	if plcConfig.UseVLAN && plcConfig.Gateway != "" {
-		config := plclib.ClientConfig{
-			IPAddress:  plcConfig.IPAddress,
-			Rack:       plcConfig.Rack,
-			Slot:       plcConfig.Slot,
-			Timeout:    10 * time.Second,
-			UseVLAN:    true,
-			Gateway:    plcConfig.Gateway,
-			SubnetMask: plcConfig.SubnetMask,
-			VLANID:     plcConfig.VLANID,
-		}
-
-		log.Printf("[TESTE] Conectando ao PLC %s (ID=%d) com VLAN para teste de leitura...",
-			plcConfig.Name, plcConfig.ID)
-		client, connectErr = plclib.NewClientWithConfig(config)
-	} else {
-		log.Printf("[TESTE] Conectando ao PLC %s (ID=%d, IP: %s) para teste de leitura...",
-			plcConfig.Name, plcConfig.ID, plcConfig.IPAddress)
-		client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
-	}
-
-	if connectErr != nil {
-		return nil, fmt.Errorf("erro ao conectar ao PLC %s: %w", plcConfig.Name, connectErr)
+	// Usar getOrCreatePLCClient para obter uma conexão
+	client, err := getOrCreatePLCClient(m, plcID)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao conectar ao PLC %s: %w", plcConfig.Name, err)
 	}
 	defer client.Close()
 
@@ -747,25 +813,43 @@ func getOrCreatePLCClient(m *Manager, plcID int) (*plclib.Client, error) {
 		return nil, fmt.Errorf("PLC %s (ID=%d) está %s", plcConfig.Name, plcConfig.ID, status)
 	}
 
-	// Cria cliente de acordo com a configuração
+	// Usa o pool para obter uma conexão
 	var client *plclib.Client
 	var connectErr error
 
-	if plcConfig.UseVLAN && plcConfig.Gateway != "" {
-		config := plclib.ClientConfig{
-			IPAddress:  plcConfig.IPAddress,
-			Rack:       plcConfig.Rack,
-			Slot:       plcConfig.Slot,
-			Timeout:    5 * time.Second,
-			UseVLAN:    true,
-			Gateway:    plcConfig.Gateway,
-			SubnetMask: plcConfig.SubnetMask,
-			VLANID:     plcConfig.VLANID,
+	if m.plcPool != nil {
+		if plcConfig.UseVLAN && plcConfig.Gateway != "" {
+			config := plclib.ClientConfig{
+				IPAddress:  plcConfig.IPAddress,
+				Rack:       plcConfig.Rack,
+				Slot:       plcConfig.Slot,
+				Timeout:    5 * time.Second,
+				UseVLAN:    true,
+				Gateway:    plcConfig.Gateway,
+				SubnetMask: plcConfig.SubnetMask,
+				VLANID:     plcConfig.VLANID,
+			}
+			client, connectErr = m.plcPool.GetConnectionWithConfig(config)
+		} else {
+			client, connectErr = m.plcPool.GetConnection(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
 		}
-
-		client, connectErr = plclib.NewClientWithConfig(config)
 	} else {
-		client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+		// Fallback para criação direta
+		if plcConfig.UseVLAN && plcConfig.Gateway != "" {
+			config := plclib.ClientConfig{
+				IPAddress:  plcConfig.IPAddress,
+				Rack:       plcConfig.Rack,
+				Slot:       plcConfig.Slot,
+				Timeout:    5 * time.Second,
+				UseVLAN:    true,
+				Gateway:    plcConfig.Gateway,
+				SubnetMask: plcConfig.SubnetMask,
+				VLANID:     plcConfig.VLANID,
+			}
+			client, connectErr = plclib.NewClientWithConfig(config)
+		} else {
+			client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+		}
 	}
 
 	if connectErr != nil {
