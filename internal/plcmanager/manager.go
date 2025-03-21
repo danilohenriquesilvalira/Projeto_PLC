@@ -17,23 +17,27 @@ import (
 // Manager controla a gerência de PLCs e suas tags
 type Manager struct {
 	db            *database.DB
-	cache         cache.Cache // Alterado de redis para cache
+	cache         cache.Cache
 	logger        *database.Logger
+	plcPool       *plclib.ConnectionPool // Novo campo para pool de conexões
 	plcCancels    map[int]context.CancelFunc
 	mutex         sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
 	checkInterval time.Duration
+	wg            sync.WaitGroup // Para encerramento gracioso
 }
 
 // NewManager cria uma nova instância do gerenciador de PLCs
-func NewManager(ctx context.Context, db *database.DB, cacheProvider cache.Cache, logger *database.Logger) *Manager {
+func NewManager(ctx context.Context, db *database.DB, cacheProvider cache.Cache,
+	logger *database.Logger, plcPool *plclib.ConnectionPool) *Manager {
 	ctx, cancel := context.WithCancel(ctx)
 
 	return &Manager{
 		db:            db,
-		cache:         cacheProvider, // Alterado de "redis" para "cache"
+		cache:         cacheProvider,
 		logger:        logger,
+		plcPool:       plcPool,
 		plcCancels:    make(map[int]context.CancelFunc),
 		mutex:         sync.RWMutex{},
 		ctx:           ctx,
@@ -61,7 +65,11 @@ func (m *Manager) Start() error {
 	m.logger.Info("Gerenciador de PLCs", "Iniciando monitoramento de PLCs")
 
 	// Inicia a goroutine principal para gerenciar os PLCs
-	go m.runPLCManager()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.runPLCManager()
+	}()
 
 	return nil
 }
@@ -74,8 +82,19 @@ func (m *Manager) Stop() {
 	// Cancela o contexto principal, o que irá propagar para todos os sub-contextos
 	m.cancel()
 
-	// Aguarda um curto período para que tudo seja encerrado
-	time.Sleep(500 * time.Millisecond)
+	// Aguarda que todas as goroutines terminem com timeout
+	waitChan := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(waitChan)
+	}()
+
+	select {
+	case <-waitChan:
+		log.Println("Gerenciador de PLCs parado com sucesso")
+	case <-time.After(5 * time.Second):
+		log.Println("Timeout ao aguardar término de goroutines do gerenciador de PLCs")
+	}
 }
 
 // runPLCManager é a goroutine principal que gerencia a lista de PLCs ativos
@@ -206,7 +225,11 @@ func (m *Manager) processPLCs(plcs []database.PLC) {
 			m.plcCancels[id] = plcCancel
 
 			// Inicia uma goroutine para monitorar este PLC
-			go m.runPLC(plcCtx, plcConfig)
+			m.wg.Add(1)
+			go func(ctx context.Context, config database.PLC) {
+				defer m.wg.Done()
+				m.runPLC(ctx, config)
+			}(plcCtx, plcConfig)
 
 			if !exists {
 				log.Printf("Iniciando monitoramento do PLC %s (ID: %d, IP: %s)", plcConfig.Name, plcConfig.ID, plcConfig.IPAddress)
@@ -253,16 +276,12 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 			if checkCounter >= 12 {
 				checkCounter = 0
 
-				// Criando o contexto e usando-o diretamente sem armazenar em variável
-				func() {
-					cancel := func() {}
-					defer cancel()
+				// Criando o contexto com timeout adequado
+				checkCtx, checkCancel := context.WithTimeout(ctx, 2*time.Second)
 
-					// Criando o contexto diretamente na chamada
-					tmpCancel := func() {}
-					checkCtx, cancelFunc := context.WithTimeout(context.Background(), 2*time.Second)
-					tmpCancel = cancelFunc
-					cancel = tmpCancel
+				// Função para verificar o status do PLC
+				func() {
+					defer checkCancel() // Garante que o contexto seja cancelado
 
 					// Primeiro verifica no cache
 					plcJSON, cacheErr := m.cache.GetValue(fmt.Sprintf("config:plc:%d", plcConfig.ID))
@@ -278,6 +297,11 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 							plcConfig = plc
 						}
 					} else {
+						// Verifica se o contexto já foi cancelado antes de acessar o DB
+						if checkCtx.Err() != nil {
+							return
+						}
+
 						// Se falhou o cache, verifica no banco de dados
 						plc, err := m.db.GetPLCByID(plcConfig.ID)
 
@@ -294,16 +318,18 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 							plcConfig = *plc
 						}
 					}
-
-					// Certifica-se de cancelar o contexto ao finalizar
-					_ = checkCtx // Para evitar erro de variável não usada
 				}()
 			}
 
-			// Configura a conexão com o PLC adequadamente para VLAN se necessário
-			var client *plclib.Client
+			// Criando contexto para timeout ao tentar conectar-se
+			// CORREÇÃO: Usando o _ para ignorar o contexto já que não o usamos diretamente
+			_, connCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer connCancel() // Garantimos que será cancelado
 
+			// Configura a conexão com o PLC usando o pool
+			var client *plclib.Client
 			var connectErr error
+
 			if plcConfig.UseVLAN && plcConfig.Gateway != "" {
 				// Usando configuração avançada com VLAN
 				config := plclib.ClientConfig{
@@ -318,13 +344,28 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 				}
 
 				log.Printf("Tentando conectar ao PLC %s (ID: %d) com VLAN...", plcConfig.Name, plcConfig.ID)
-				client, connectErr = plclib.NewClientWithConfig(config)
+
+				// Usa o pool de conexões se disponível
+				if m.plcPool != nil {
+					client, connectErr = m.plcPool.GetConnectionWithConfig(config)
+				} else {
+					client, connectErr = plclib.NewClientWithConfig(config)
+				}
 			} else {
 				// Configuração básica sem VLAN
 				log.Printf("Tentando conectar ao PLC %s (ID: %d, IP: %s, Rack: %d, Slot: %d)...",
 					plcConfig.Name, plcConfig.ID, plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
-				client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+
+				// Usa o pool de conexões se disponível
+				if m.plcPool != nil {
+					client, connectErr = m.plcPool.GetConnection(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+				} else {
+					client, connectErr = plclib.NewClient(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+				}
 			}
+
+			// Limpeza do contexto de conexão (já não precisa pelo defer)
+			// connCancel()
 
 			if connectErr != nil {
 				log.Printf("Erro ao conectar ao PLC %s: %v", plcConfig.Name, connectErr)
@@ -385,21 +426,35 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 			clientCtx, clientCancel := context.WithCancel(ctx)
 			errChan := make(chan error, 2)
 
+			// Usamos waitgroup para garantir que todas as goroutines sejam encerradas
+			var clientWg sync.WaitGroup
+			clientWg.Add(2)
+
 			// Inicia goroutine para monitorar o status do PLC
 			go func() {
+				defer clientWg.Done()
 				log.Printf("Iniciando monitoramento de status para PLC ID %d", plcConfig.ID)
 				if err := m.updatePLCStatus(clientCtx, plcConfig.ID, client); err != nil {
 					log.Printf("Erro no monitoramento de status do PLC ID %d: %v", plcConfig.ID, err)
-					errChan <- err
+					select {
+					case errChan <- err:
+					default:
+						log.Printf("Canal de erros cheio, descartando erro: %v", err)
+					}
 				}
 			}()
 
 			// Inicia goroutine para gerenciar as tags do PLC
 			go func() {
+				defer clientWg.Done()
 				log.Printf("Iniciando gerenciamento de tags para PLC ID %d", plcConfig.ID)
 				if err := m.managePLCTags(clientCtx, plcConfig.ID, plcConfig.Name, client); err != nil {
 					log.Printf("Erro no gerenciamento de tags do PLC ID %d: %v", plcConfig.ID, err)
-					errChan <- fmt.Errorf("erro no gerenciamento de tags: %v", err)
+					select {
+					case errChan <- fmt.Errorf("erro no gerenciamento de tags: %v", err):
+					default:
+						log.Printf("Canal de erros cheio, descartando erro: %v", err)
+					}
 				}
 			}()
 
@@ -409,11 +464,83 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 				clientCancel()
 				log.Printf("Erro crítico no PLC %s: %v", plcConfig.Name, err)
 				m.logger.Error("Erro crítico no PLC", fmt.Sprintf("%s: %v", plcConfig.Name, err))
-				client.Close()
+
+				// Aguarda as goroutines terminarem com timeout
+				waitDone := make(chan struct{})
+				go func() {
+					clientWg.Wait()
+					close(waitDone)
+				}()
+
+				select {
+				case <-waitDone:
+					// Goroutines terminaram normalmente
+				case <-time.After(2 * time.Second):
+					log.Printf("Timeout aguardando goroutines do PLC %s terminarem", plcConfig.Name)
+				}
+
+				// Se estamos usando o pool, libera a conexão
+				if m.plcPool != nil {
+					if plcConfig.UseVLAN && plcConfig.Gateway != "" {
+						config := plclib.ClientConfig{
+							IPAddress: plcConfig.IPAddress,
+							Rack:      plcConfig.Rack,
+							Slot:      plcConfig.Slot,
+						}
+						m.plcPool.ReleaseWithConfig(config)
+					} else {
+						m.plcPool.Release(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+					}
+				} else {
+					// Se não estamos usando pool, fechamos a conexão
+					client.Close()
+				}
 
 			case <-clientCtx.Done():
 				clientCancel()
-				client.Close()
+				// Aguarda goroutines terminarem
+				clientWg.Wait()
+
+				// Se estamos usando o pool, libera a conexão
+				if m.plcPool != nil {
+					if plcConfig.UseVLAN && plcConfig.Gateway != "" {
+						config := plclib.ClientConfig{
+							IPAddress: plcConfig.IPAddress,
+							Rack:      plcConfig.Rack,
+							Slot:      plcConfig.Slot,
+						}
+						m.plcPool.ReleaseWithConfig(config)
+					} else {
+						m.plcPool.Release(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+					}
+				} else {
+					// Se não estamos usando pool, fechamos a conexão
+					client.Close()
+				}
+				return
+
+			case <-ctx.Done():
+				// Caso o contexto pai seja cancelado
+				clientCancel()
+				// Aguarda goroutines terminarem
+				clientWg.Wait()
+
+				// Se estamos usando o pool, libera a conexão
+				if m.plcPool != nil {
+					if plcConfig.UseVLAN && plcConfig.Gateway != "" {
+						config := plclib.ClientConfig{
+							IPAddress: plcConfig.IPAddress,
+							Rack:      plcConfig.Rack,
+							Slot:      plcConfig.Slot,
+						}
+						m.plcPool.ReleaseWithConfig(config)
+					} else {
+						m.plcPool.Release(plcConfig.IPAddress, plcConfig.Rack, plcConfig.Slot)
+					}
+				} else {
+					// Se não estamos usando pool, fechamos a conexão
+					client.Close()
+				}
 				return
 			}
 
@@ -427,4 +554,38 @@ func (m *Manager) runPLC(ctx context.Context, plcConfig database.PLC) {
 			}
 		}
 	}
+}
+
+// GetPLCStatusCount retorna um resumo com contagem de PLCs por status
+func (m *Manager) GetPLCStatusCount() map[string]int {
+	status := make(map[string]int)
+
+	// Tenta obter do cache
+	plcsJSON, err := m.cache.GetValue("config:plcs:all")
+	if err != nil || plcsJSON == "" {
+		// Fallback para banco
+		plcs, dbErr := m.db.GetActivePLCs()
+		if dbErr != nil {
+			log.Printf("Erro ao obter PLCs para contagem de status: %v", dbErr)
+			return status
+		}
+
+		for _, plc := range plcs {
+			status[plc.Status]++
+		}
+		return status
+	}
+
+	// Do cache
+	var plcs []database.PLC
+	if err := json.Unmarshal([]byte(plcsJSON), &plcs); err != nil {
+		log.Printf("Erro ao deserializar PLCs para contagem de status: %v", err)
+		return status
+	}
+
+	for _, plc := range plcs {
+		status[plc.Status]++
+	}
+
+	return status
 }

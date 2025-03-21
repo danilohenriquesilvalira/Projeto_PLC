@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -14,7 +16,9 @@ import (
 	"Projeto_PLC/internal/cache"
 	"Projeto_PLC/internal/configsync"
 	"Projeto_PLC/internal/database"
+	"Projeto_PLC/internal/plc"
 	"Projeto_PLC/internal/plcmanager"
+	"Projeto_PLC/internal/websocket"
 
 	"github.com/lib/pq"
 )
@@ -29,6 +33,9 @@ func main() {
 		log.Printf("Aviso: Não foi possível carregar configurações do arquivo: %v. Usando configurações padrão.", err)
 		cfg = config.DefaultConfig()
 	}
+
+	// Contador WaitGroup para encerramento gracioso
+	var wg sync.WaitGroup
 
 	// Conectar ao PostgreSQL permanente (uso futuro)
 	permanentDB, err := database.NewDB(cfg.Database.PostgreSQL)
@@ -68,14 +75,18 @@ func main() {
 	testCache(cacheProvider)
 
 	// Configurar limpeza periódica simples para valores de runtime
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		// Executar a cada hora
 		cleanupTicker := time.NewTicker(1 * time.Hour)
 		defer cleanupTicker.Stop()
-		
+
 		for {
 			select {
 			case <-ctx.Done():
+				log.Println("Encerrando rotina de limpeza de cache")
 				return
 			case <-cleanupTicker.C:
 				// Abordagem simples: listar e remover chaves conhecidas
@@ -126,10 +137,14 @@ func main() {
 		defer pgListener.Close()
 
 		// Goroutine para processar notificações
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
 			for {
 				select {
 				case <-ctx.Done():
+					log.Println("Encerrando processamento de notificações PostgreSQL")
 					return
 				case notification := <-pgListener.Notify:
 					if notification == nil {
@@ -162,12 +177,17 @@ func main() {
 	}
 
 	// Agende sincronizações periódicas:
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		syncTicker := time.NewTicker(30 * time.Second)
 		defer syncTicker.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
+				log.Println("Encerrando sincronizações periódicas")
 				return
 			case <-syncTicker.C:
 				if err := simpleSyncManager.SyncAll(); err != nil {
@@ -188,14 +208,68 @@ func main() {
 	// Verifica se a sincronização inicial funcionou
 	verifySyncSuccess(cacheProvider)
 
+	// Criar o pool de conexões PLC
+	plcPool := plc.NewConnectionPool(30 * time.Minute)
+	log.Println("Pool de conexões PLC iniciado")
+
 	// Criar e iniciar o gerenciador de PLCs
-	plcManager := plcmanager.NewManager(ctx, plcDB, cacheProvider, logger)
+	plcManager := plcmanager.NewManager(ctx, plcDB, cacheProvider, logger, plcPool)
 	if err := plcManager.Start(); err != nil {
 		log.Printf("Erro ao iniciar gerenciador de PLCs: %v", err)
 		log.Println("O sistema continuará em execução, mas a comunicação com PLCs pode estar limitada")
 	} else {
 		log.Println("Gerenciador de PLCs iniciado com sucesso")
 	}
+
+	// ===== INÍCIO DA CONFIGURAÇÃO DO WEBSOCKET =====
+
+	// Inicializa o gerenciador WebSocket - MODIFICADO para passar plcManager
+	log.Println("Inicializando gerenciador WebSocket...")
+	wsGerenciador := websocket.NovoGerenciador(plcDB, cacheProvider, plcManager)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wsGerenciador.Iniciar()
+	}()
+
+	// Adiciona PLCs ativos para monitoramento
+	plcsAtivos, err := plcDB.GetActivePLCs()
+	if err != nil {
+		log.Printf("Erro ao obter PLCs ativos para WebSocket: %v", err)
+	} else {
+		for _, plc := range plcsAtivos {
+			wsGerenciador.AdicionarPLCMonitorado(plc.ID)
+			log.Printf("PLC ID %d adicionado para monitoramento via WebSocket", plc.ID)
+		}
+	}
+
+	// Configura o manipulador WebSocket
+	http.HandleFunc("/ws", wsGerenciador.ManipularWS)
+
+	// Inicia o servidor HTTP
+	wsPort := getEnv("WS_PORT", "8080")
+	srv := &http.Server{
+		Addr: ":" + wsPort,
+		// Configurações de timeout mais seguras
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Iniciar o servidor HTTP em uma goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("Servidor WebSocket iniciado na porta %s", wsPort)
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Erro ao iniciar servidor HTTP: %v", err)
+		}
+	}()
+
+	log.Printf("Interface WebSocket disponível em: ws://localhost:%s/ws", wsPort)
+
+	// ===== FIM DA CONFIGURAÇÃO DO WEBSOCKET =====
 
 	// Configurar captura de sinais do sistema operacional para encerramento gracioso
 	signalChan := make(chan os.Signal, 1)
@@ -204,12 +278,45 @@ func main() {
 	// Aguardar sinal para encerrar
 	sig := <-signalChan
 	log.Printf("Recebido sinal %v, iniciando encerramento gracioso...", sig)
+
+	// Criar um contexto com timeout para encerramento gracioso
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// Encerrar o servidor HTTP graciosamente
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Erro ao encerrar o servidor HTTP: %v", err)
+	} else {
+		log.Println("Servidor HTTP encerrado com sucesso")
+	}
+
+	// Parar o gerenciador WebSocket
+	wsGerenciador.Parar()
+
+	// Fechar o pool de conexões PLC
+	plcPool.Close()
+
+	// Cancelar o contexto principal para encerrar todas as goroutines
 	cancel()
 
+	// Aguardar que todas as goroutines sejam encerradas
 	log.Println("Aguardando encerramento de todos os componentes...")
-	time.Sleep(2 * time.Second)
 
-	logger.Info("Backend", "Sistema encerrado")
+	// Esperar goroutines terminarem com timeout
+	waitChan := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitChan)
+	}()
+
+	select {
+	case <-waitChan:
+		log.Println("Todas as goroutines encerraram com sucesso")
+	case <-time.After(10 * time.Second):
+		log.Println("Timeout ao aguardar término de todas as goroutines")
+	}
+
+	logger.Info("Backend", "Sistema encerrado com sucesso")
 	log.Println("Serviço de backend encerrado com sucesso")
 }
 
@@ -226,14 +333,14 @@ func cleanRuntimeTags(cacheProvider cache.Cache) {
 	// Tentativa básica de extração de IDs de PLC do JSON (sem depender de unmarshal)
 	// Procura padrões como: "id":1
 	plcIds := extractPLCIDs(plcsJSON)
-	
+
 	if len(plcIds) == 0 {
 		log.Println("Nenhum PLC encontrado para limpeza de cache")
 		return
 	}
 
 	removedCount := 0
-	
+
 	// Para cada PLC, obter suas tags e limpar valores de runtime
 	for _, plcID := range plcIds {
 		// Obter lista de tags para este PLC
@@ -241,10 +348,10 @@ func cleanRuntimeTags(cacheProvider cache.Cache) {
 		if err != nil || tagsJSON == "" {
 			continue
 		}
-		
+
 		// Extração simples de IDs de tags
 		tagIds := extractTagIDs(tagsJSON)
-		
+
 		// Remover cada tag de runtime
 		for _, tagID := range tagIds {
 			runtimeKey := fmt.Sprintf("plc:%d:tag:%d", plcID, tagID)
@@ -253,7 +360,7 @@ func cleanRuntimeTags(cacheProvider cache.Cache) {
 			}
 		}
 	}
-	
+
 	log.Printf("Limpeza de cache: removidas %d chaves de runtime", removedCount)
 }
 
